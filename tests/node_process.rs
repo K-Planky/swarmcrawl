@@ -1,4 +1,4 @@
-//! Actual host-run crawl nodes, real Redis, and response-gated local HTTP.
+//! Actual host-run swarmcrawl nodes, real Redis, and response-gated local HTTP.
 #![cfg(unix)]
 
 #[path = "support/http.rs"]
@@ -30,7 +30,7 @@ struct NodeProcess {
 
 impl NodeProcess {
     fn start(context: &Context, timeout: u64) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_crawl"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"))
             .args([
                 "node",
                 "--namespace",
@@ -46,7 +46,7 @@ impl NodeProcess {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("start actual crawl node");
+            .expect("start actual swarmcrawl node");
         let stderr = child.stderr.take().unwrap();
         let log = Arc::new(Mutex::new(String::new()));
         let owned = log.clone();

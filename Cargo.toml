@@ -7,7 +7,7 @@ description = "A Redis-coordinated distributed crawler"
 publish = false
 
 [[bin]]
-name = "crawl"
+name = "swarmcrawl"
 path = "src/main.rs"
 
 [dependencies]

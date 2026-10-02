@@ -16,7 +16,7 @@ use swarmcrawl::{
 
 #[derive(Parser)]
 #[command(
-    name = "crawl",
+    name = "swarmcrawl",
     version,
     about = "Redis-coordinated distributed crawler"
 )]

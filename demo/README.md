@@ -2,7 +2,7 @@
 
 Run from the repository root on Linux/macOS/WSL with **Docker, Rustup, Python 3.10+
 (standard library only), curl, Bash and GNU `timeout`**. On macOS, install coreutils
-and use its `timeout` command. Only Redis runs in Docker; three `crawl node`
+and use its `timeout` command. Only Redis runs in Docker; three `swarmcrawl node`
 processes and the demo HTTP server run on the host. No public website is needed.
 For build/configuration, coordination and known limitations, see [../README.md](../README.md).
 
@@ -58,7 +58,7 @@ Then, in terminal A:
 
 ```sh
 docker exec "$DEMO_CONTAINER" redis-cli ping
-./target/debug/crawl check
+./target/debug/swarmcrawl check
 ```
 
 Expect `PONG` and `Redis connectivity: OK (PONG)`. If Docker forwarding is not ready
@@ -87,19 +87,19 @@ Expect `released: false`, `held: 0`, `get_counts: {}`, `expired: 0` and
 ## 3. Submit without nodes (terminal A)
 
 ```sh
-./target/debug/crawl submit http://127.0.0.1:8000/docs/ http://127.0.0.1:8000/other/
+./target/debug/swarmcrawl submit http://127.0.0.1:8000/docs/ http://127.0.0.1:8000/other/
 # job 1  input 1  created
 # job 2  input 2  created
-./target/debug/crawl submit 'http://127.0.0.1:8000/docs/#again'
+./target/debug/swarmcrawl submit 'http://127.0.0.1:8000/docs/#again'
 # job 1  input 1  existing
-./target/debug/crawl status 1
-./target/debug/crawl status 2
+./target/debug/swarmcrawl status 1
+./target/debug/swarmcrawl status 2
 ```
 
 A **fresh** namespace has IDs 1 and 2. Otherwise use the printed IDs, or perform
 the reset below before repeating. Both snapshots show `crawled 0  frontier 1
 in flight 0  files 0  discovered 1  running`. The HTTP request counts remain empty:
-submission contacted Redis only. `crawl stats 1` now exits **1** with a not-done
+submission contacted Redis only. `swarmcrawl stats 1` now exits **1** with a not-done
 message and no partial numbers; that failure is expected.
 
 ## 4. Start three nodes (terminals C, D and E)
@@ -108,7 +108,7 @@ In **each** terminal, from this repository, copy the three configuration lines
 above and run:
 
 ```sh
-./target/debug/crawl node --fetch-timeout-secs 300
+./target/debug/swarmcrawl node --fetch-timeout-secs 300
 ```
 
 Wait for each ready message with a distinct PID. Redis also allocates a fresh
@@ -121,9 +121,9 @@ In terminal A, inspect the site and both progress snapshots:
 ```sh
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/_demo/state \
   | python3 -m json.tool
-./target/debug/crawl status 1
-./target/debug/crawl status 2
-./target/debug/crawl stats 1
+./target/debug/swarmcrawl status 1
+./target/debug/swarmcrawl status 2
+./target/debug/swarmcrawl stats 1
 # Expected nonzero: no final statistics while a body is held.
 ```
 
@@ -137,7 +137,7 @@ an exact intermediate split or confuse `crawled` attempts with existing files.
 In the helper/observer terminal F, copy the shared configuration and run:
 
 ```sh
-timeout 240s ./target/debug/crawl status -f 1
+timeout 240s ./target/debug/swarmcrawl status -f 1
 ```
 
 The observer prints running progress and waits. It cannot declare done while
@@ -153,9 +153,9 @@ owner explains the queue/ownership/completion invariant.
 curl --fail --silent --show-error --max-time 5 --request POST \
   http://127.0.0.1:8000/_demo/release
 # released
-timeout 30s ./target/debug/crawl status -f 2
-./target/debug/crawl stats 1
-./target/debug/crawl stats 2
+timeout 30s ./target/debug/swarmcrawl status -f 2
+./target/debug/swarmcrawl stats 1
+./target/debug/swarmcrawl stats 2
 ```
 
 Both follow commands exit **0**. Each final snapshot is exactly:
@@ -205,7 +205,7 @@ parent accounting and final stats is one Redis atomic operation, not a local loc
    needed. A mid-crawl stop can take up to the HTTP deadline; release the demo gate
    before stopping all nodes to avoid needless timeouts. Graceful drain is not
    crash recovery.
-2. In terminal A, `./target/debug/crawl stats 1` and repeat `submit` still return
+2. In terminal A, `./target/debug/swarmcrawl stats 1` and repeat `submit` still return
    the same results/ID with **no nodes running**. Redis retains them without TTLs.
 3. Press **Ctrl-C in B** to stop the HTTP server. This releases local server waits;
    it is not a crawler recovery mechanism.
@@ -224,7 +224,7 @@ parent accounting and final stats is one Redis atomic operation, not a local loc
 ## Troubleshooting and checks
 
 - Missing ready messages: verify Docker daemon, port collisions, shared Redis
-  URL/database/namespace and `crawl check` in each client shell.
+  URL/database/namespace and `swarmcrawl check` in each client shell.
 - `held` below 30: ensure three live nodes, no stale jobs and no inherited short
   timeout. Read all node errors. Do not remove live ownership or add retries.
 - A failed job never returns final stats or restarts on resubmission. If the gate

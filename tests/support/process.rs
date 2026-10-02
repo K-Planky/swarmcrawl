@@ -44,7 +44,7 @@ impl Process {
     }
 
     pub fn with_env(context: &Context, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_crawl"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"));
         command
             .args(args)
             // Retain only this suite's explicitly supplied Redis endpoint.
@@ -57,7 +57,7 @@ impl Process {
         for (name, value) in env {
             command.env(name, value);
         }
-        let mut child = command.spawn().expect("start actual crawl binary");
+        let mut child = command.spawn().expect("start actual swarmcrawl binary");
         let (stdout, out_reader) = capture(child.stdout.take().unwrap());
         let (stderr, err_reader) = capture(child.stderr.take().unwrap());
         Self {

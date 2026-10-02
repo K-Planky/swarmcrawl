@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
 
-fn crawl(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_crawl"));
+fn swarmcrawl(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"));
     command
         .args(args)
         .env_remove("CRAWL_REDIS_URL")
@@ -11,7 +11,7 @@ fn crawl(args: &[&str], env: &[(&str, &str)]) -> Output {
     for (name, value) in env {
         command.env(name, value);
     }
-    command.output().expect("run crawl binary")
+    command.output().expect("run swarmcrawl binary")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -20,39 +20,45 @@ fn text(bytes: &[u8]) -> String {
 
 #[test]
 fn help_and_version_work_without_redis() {
-    let help = crawl(&["--help"], &[]);
+    let help = swarmcrawl(&["--help"], &[]);
     assert!(help.status.success());
     let help = text(&help.stdout);
-    assert!(help.contains("check"));
+    assert!(help.contains("Usage: swarmcrawl [OPTIONS] <COMMAND>"));
+    assert!(!help.contains("Usage: crawl"));
     assert!(help.contains("--redis-url"));
-    for name in ["node", "submit", "status", "stats"] {
-        assert!(help.contains(name));
-    }
+    assert!(help.contains("CRAWL_REDIS_URL"));
+    assert!(help.contains("CRAWL_REDIS_TIMEOUT_SECS"));
+    assert!(help.contains("CRAWL_JOB_NAMESPACE"));
     assert!(help.contains("--namespace"));
-    for name in ["submit", "status", "stats"] {
-        let output = crawl(&[name, "--help"], &[]);
+    for name in ["check", "node", "submit", "status", "stats"] {
+        assert!(help.contains(name));
+        let output = swarmcrawl(&[name, "--help"], &[]);
         assert!(output.status.success());
-        assert!(text(&output.stdout).contains("--namespace"));
+        let subcommand_help = text(&output.stdout);
+        assert!(subcommand_help.contains(&format!("Usage: swarmcrawl {name}")));
+        assert!(!subcommand_help.contains("Usage: crawl"));
+        assert!(subcommand_help.contains("--namespace"));
     }
-    let status_help = crawl(&["status", "--help"], &[]);
+    let status_help = swarmcrawl(&["status", "--help"], &[]);
     assert!(text(&status_help.stdout).contains("--follow"));
     assert!(text(&status_help.stdout).contains("500 ms"));
-    let node_help = crawl(&["node", "--help"], &[]);
+    let node_help = swarmcrawl(&["node", "--help"], &[]);
     assert!(node_help.status.success());
     assert!(text(&node_help.stdout).contains("--fetch-timeout-secs"));
+    assert!(text(&node_help.stdout).contains("CRAWL_FETCH_TIMEOUT_SECS"));
     assert!(text(&node_help.stdout).contains("--namespace"));
 
-    let version = crawl(&["--version"], &[]);
+    let version = swarmcrawl(&["--version"], &[]);
     assert!(version.status.success());
     assert_eq!(
         text(&version.stdout).trim(),
-        format!("crawl {}", env!("CARGO_PKG_VERSION"))
+        format!("swarmcrawl {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
 #[test]
 fn invalid_redis_url_fails_without_disclosing_credentials() {
-    let output = crawl(
+    let output = swarmcrawl(
         &[
             "--redis-url",
             "redis://user:test-secret@localhost/bad-db",
@@ -69,7 +75,7 @@ fn invalid_redis_url_fails_without_disclosing_credentials() {
 
 #[test]
 fn help_hides_redis_environment_value() {
-    let output = crawl(
+    let output = swarmcrawl(
         &["--help"],
         &[("CRAWL_REDIS_URL", "redis://user:test-secret@localhost/0")],
     );
@@ -81,7 +87,7 @@ fn help_hides_redis_environment_value() {
         vec!["status", "--help"],
         vec!["stats", "--help"],
     ] {
-        let output = crawl(
+        let output = swarmcrawl(
             &args,
             &[("CRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace")],
         );
@@ -94,10 +100,10 @@ fn help_hides_redis_environment_value() {
 fn flags_override_environment_and_environment_overrides_defaults() {
     // Invalid inputs avoid network access; different errors show which source
     // was chosen without mutating this test process's environment.
-    let output = crawl(&["check"], &[("CRAWL_REDIS_URL", "not-a-url")]);
+    let output = swarmcrawl(&["check"], &[("CRAWL_REDIS_URL", "not-a-url")]);
     assert!(text(&output.stderr).contains("invalid Redis URL"));
 
-    let output = crawl(
+    let output = swarmcrawl(
         &["--redis-url", "not-a-url", "check"],
         &[("CRAWL_REDIS_URL", "redis://127.0.0.1:6379/0")],
     );
@@ -107,7 +113,7 @@ fn flags_override_environment_and_environment_overrides_defaults() {
         ["check", "--redis-timeout-secs", "5"],
         ["--redis-timeout-secs", "5", "check"],
     ] {
-        let output = crawl(
+        let output = swarmcrawl(
             &args,
             &[
                 ("CRAWL_REDIS_URL", "not-a-url"),
@@ -123,12 +129,12 @@ fn flags_override_environment_and_environment_overrides_defaults() {
 #[test]
 fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
     for value in ["0", "61", "not-a-number"] {
-        let output = crawl(&["--redis-timeout-secs", value, "check"], &[]);
+        let output = swarmcrawl(&["--redis-timeout-secs", value, "check"], &[]);
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         assert!(text(&output.stderr).contains("Redis timeout must be between 1 and 60 seconds"));
     }
-    let output = crawl(&[], &[]);
+    let output = swarmcrawl(&[], &[]);
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("Usage:"));
     for args in [
@@ -137,7 +143,7 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
         vec!["status", "-f"],
         vec!["stats"],
     ] {
-        let output = crawl(&args, &[]);
+        let output = swarmcrawl(&args, &[]);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert!(text(&output.stderr).contains("Usage:"));
@@ -147,7 +153,7 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
 #[test]
 fn job_validation_precedes_network_access_and_never_echoes_inputs() {
     let endpoint = [("CRAWL_REDIS_URL", "redis://127.0.0.1:1/0")];
-    let output = crawl(
+    let output = swarmcrawl(
         &[
             "submit",
             "https://example.org/valid/",
@@ -162,7 +168,7 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
     assert!(error.contains("no URLs submitted"));
     assert!(!error.contains("fixture-"));
     for command in ["status", "stats"] {
-        let output = crawl(&[command, "fixture-sensitive-id"], &endpoint);
+        let output = swarmcrawl(&[command, "fixture-sensitive-id"], &endpoint);
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         let error = text(&output.stderr);
@@ -175,7 +181,7 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
         vec!["status", "-f", "1"],
         vec!["stats", "1"],
     ] {
-        let output = crawl(&args, &[("CRAWL_JOB_NAMESPACE", "invalid namespace")]);
+        let output = swarmcrawl(&args, &[("CRAWL_JOB_NAMESPACE", "invalid namespace")]);
         assert_eq!(output.status.code(), Some(1));
         assert!(text(&output.stderr).contains("invalid job namespace"));
     }
@@ -184,12 +190,12 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
 #[test]
 fn node_settings_are_validated_redacted_and_flags_override_environment() {
     for value in ["0", "301", "fixture-sensitive-value"] {
-        let output = crawl(&["node", "--fetch-timeout-secs", value], &[]);
+        let output = swarmcrawl(&["node", "--fetch-timeout-secs", value], &[]);
         assert_eq!(output.status.code(), Some(1));
         assert!(text(&output.stderr).contains("HTTP timeout must be between 1 and 300 seconds"));
         assert!(!text(&output.stderr).contains("fixture-sensitive-value"));
     }
-    let output = crawl(
+    let output = swarmcrawl(
         &[
             "node",
             "--fetch-timeout-secs",
@@ -203,7 +209,7 @@ fn node_settings_are_validated_redacted_and_flags_override_environment() {
     assert!(text(&output.stderr).contains("invalid job namespace"));
     assert!(!text(&output.stderr).contains("fixture-sensitive-value"));
 
-    let output = crawl(
+    let output = swarmcrawl(
         &["node", "--help"],
         &[
             ("CRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value"),

@@ -1,14 +1,15 @@
 # swarmcrawl
 
 A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-run
-binary is named `crawl`; the Cargo package and library remain `swarmcrawl`.
+binary, Cargo package and library are all named `swarmcrawl`. There is no `crawl`
+compatibility alias; existing `CRAWL_*` configuration names are unchanged.
 
-**Current capability:** `crawl node`, `submit`, `status`/`status -f`, and `stats`
+**Current capability:** `swarmcrawl node`, `submit`, `status`/`status -f`, and `stats`
 work against the shared Redis job protocol. Host-run nodes concurrently
 claim/fetch/publish work, stay available for later submissions, and drain owned
 work on graceful shutdown. User commands talk only to Redis; finished statistics
 are immediately readable by a new CLI process and retained after nodes exit.
-`crawl --help`, `--version`, and the read-only Redis `check` also work. Domain,
+`swarmcrawl --help`, `--version`, and the read-only Redis `check` also work. Domain,
 HTTP, Redis and CLI/node process tests pass, including adversarial traversal with
 identical hand-checked totals for **1, 2 and 3 participating nodes** and concurrent
 overlapping jobs. A [deterministic live-demo runbook](demo/README.md) supplies two
@@ -67,11 +68,11 @@ docker run --detach --rm --name swarmcrawl-redis-dev \
 docker exec swarmcrawl-redis-dev redis-cli ping
 cargo run --locked -- check
 # Once built, the equivalent host command is:
-./target/debug/crawl check
+./target/debug/swarmcrawl check
 ```
 
-Expect `PONG` from redis-cli and `Redis connectivity: OK (PONG)` from `crawl`.
-If Redis is not ready yet, retry the read-only check; each `crawl check` is bounded
+Expect `PONG` from redis-cli and `Redis connectivity: OK (PONG)` from `swarmcrawl`.
+If Redis is not ready yet, retry the read-only check; each `swarmcrawl check` is bounded
 by its configured timeout. It exits nonzero on failure and never prints success
 first. This container uses disposable state with persistence disabled. Job identities
 and results have no TTL and last until Redis is cleared or shut down; persistence
@@ -87,7 +88,7 @@ The default published address is loopback, **not all interfaces**. For clients o
 other machines, publish on the Redis host's private/trusted interface instead of
 `127.0.0.1`, restrict its firewall to the trusted node/CLI hosts, and configure Redis
 ACL/passwords through a private configuration file. Point each client at that
-host's reachable IP, not its own loopback address, and run `crawl check` from each
+host's reachable IP, not its own loopback address, and run `swarmcrawl check` from each
 host. Do not expose Redis to the public Internet or disable security protections.
 The current build supports plain TCP `redis://` only, not TLS (`rediss://`) or Unix
 sockets; credentials on plaintext TCP require a trusted isolated network.
@@ -104,7 +105,7 @@ setup:
    isolation, not access control; every Redis client is trusted.
 3. Build the same revision on each node/CLI host. Supply `CRAWL_REDIS_URL` externally
    with the Redis host's reachable address and configured authentication. Use the
-   same Redis database and `CRAWL_JOB_NAMESPACE` on every client; verify `crawl check`
+   same Redis database and `CRAWL_JOB_NAMESPACE` on every client; verify `swarmcrawl check`
    from each machine before starting host-run nodes.
 4. Submit a target reachable from **every node**, not a node's loopback HTTP address.
    Redis hosts do not need access to the website, and nodes need no inbound crawler
@@ -128,11 +129,11 @@ after selection, so an overridden invalid environment value does not cause failu
 Examples with no credentials:
 
 ```sh
-crawl --redis-url redis://127.0.0.1:6380/0 check
-CRAWL_REDIS_URL=redis://127.0.0.1:6380/0 crawl check --redis-timeout-secs 10
+swarmcrawl --redis-url redis://127.0.0.1:6380/0 check
+CRAWL_REDIS_URL=redis://127.0.0.1:6380/0 swarmcrawl check --redis-timeout-secs 10
 ```
 
-Use `./target/debug/crawl` unless the binary has been installed or added to PATH.
+Use `./target/debug/swarmcrawl` unless the binary has been installed or added to PATH.
 Prefer an externally supplied environment variable rather than command-line URLs
 for credentials (command lines can appear in shell history/process listings).
 Never commit actual credentials. Help hides environment values; configuration
@@ -159,24 +160,24 @@ is only PING and does not access or validate job namespaces.
 ## User job commands
 
 Start Redis as above and build `cargo build --locked`. Use the host binary directly;
-launch one or more `./target/debug/crawl node` processes in other terminals when
+launch one or more `./target/debug/swarmcrawl node` processes in other terminals when
 ready to crawl. Submission also works while no nodes run. All commands use the
-configuration above; use `crawl <command> --help` for command-specific help.
+configuration above; use `swarmcrawl <command> --help` for command-specific help.
 Replace these example loopback URLs with your own reachable HTTP(S) bases:
 
 ```sh
-./target/debug/crawl submit http://127.0.0.1:8000/docs/ http://127.0.0.1:8000/other/
+./target/debug/swarmcrawl submit http://127.0.0.1:8000/docs/ http://127.0.0.1:8000/other/
 # Example on a fresh namespace (IDs may differ on an existing one):
 # job 1  input 1  created
 # job 2  input 2  created
-./target/debug/crawl submit http://127.0.0.1:8000/docs/#intro
+./target/debug/swarmcrawl submit http://127.0.0.1:8000/docs/#intro
 # job 1  input 1  existing
-./target/debug/crawl status 1
-./target/debug/crawl status -f 1
-./target/debug/crawl stats 1
+./target/debug/swarmcrawl status 1
+./target/debug/swarmcrawl status -f 1
+./target/debug/swarmcrawl stats 1
 # Same deployment namespace can be set before or after any job command:
-./target/debug/crawl --namespace swarmcrawl:v1 status 1
-./target/debug/crawl stats 1 --namespace swarmcrawl:v1
+./target/debug/swarmcrawl --namespace swarmcrawl:v1 status 1
+./target/debug/swarmcrawl stats 1 --namespace swarmcrawl:v1
 ```
 
 - **`submit <url>...`:** each input is an independent job with that URL as seed and
@@ -580,11 +581,11 @@ host in its own terminal (not a crawler container):
 
 ```sh
 cargo build --locked
-./target/debug/crawl node
+./target/debug/swarmcrawl node
 # Repeat in another terminal for N >= 1, or point each host at the same Redis:
-./target/debug/crawl --redis-url redis://127.0.0.1:6379/0 node
+./target/debug/swarmcrawl --redis-url redis://127.0.0.1:6379/0 node
 # Optional HTTP deadline and shared deployment namespace:
-./target/debug/crawl node --fetch-timeout-secs 60 --namespace swarmcrawl:v1
+./target/debug/swarmcrawl node --fetch-timeout-secs 60 --namespace swarmcrawl:v1
 ```
 
 A ready message on stderr means the node connected and allocated its identity.
@@ -724,7 +725,7 @@ and four gated independent processes claiming/publishing a convergent graph with
 77 words). Process cleanup and case deadlines match the storage suite.
 The frontier suite uses **mock page outcomes**, not an HTTP server or application
 node binary. The separate `tests/node_process.rs` suite has eight opt-in cases
-using the actual `crawl node` binary, real Redis and gated local HTTP:
+using the actual `swarmcrawl node` binary, real Redis and gated local HTTP:
 
 - Jobs submitted before and after startup, mixed HTML/image/404/redirect outcomes,
   cycles/fragment duplicates and scope exclusion: 3 files, 2 extensions, 4 words

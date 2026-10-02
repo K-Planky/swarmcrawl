@@ -74,7 +74,7 @@ fi
 timeout 180s cargo build --locked
 host_ready=false
 for ((attempt = 0; attempt < 20; attempt++)); do
-    if probe=$(timeout 3s ./target/debug/crawl --redis-timeout-secs 1 check 2>&1); then
+    if probe=$(timeout 3s ./target/debug/swarmcrawl --redis-timeout-secs 1 check 2>&1); then
         host_ready=true
         break
     fi
@@ -86,5 +86,5 @@ if [[ "$host_ready" != true ]]; then
     exit 1
 fi
 
-timeout 180s cargo run --locked -- check
+timeout 180s cargo run --locked --bin swarmcrawl -- check
 timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process --test cli_jobs -- --ignored
