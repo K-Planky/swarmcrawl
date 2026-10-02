@@ -1,6 +1,8 @@
 //! Actual user commands against isolated real Redis; only nodes contact HTTP.
 #![cfg(unix)]
 
+// Broader traversal/concurrency proofs reuse this binary's CLI/Redis harness.
+mod distributed;
 #[path = "support/http.rs"]
 mod http;
 #[path = "support/process.rs"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Redis protocol/application-node/user-CLI checks; only owned-state cleanup.
+# Redis protocol/node/CLI/adversarial distributed checks; only owned-state cleanup.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

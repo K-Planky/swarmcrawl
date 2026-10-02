@@ -9,8 +9,9 @@ claim/fetch/publish work, stay available for later submissions, and drain owned
 work on graceful shutdown. User commands talk only to Redis; finished statistics
 are immediately readable by a new CLI process and retained after nodes exit.
 `crawl --help`, `--version`, and the read-only Redis `check` also work. Domain,
-HTTP, Redis and CLI/node process tests pass; broader adversarial end-to-end
-comparisons and final demo/release readiness are still pending.
+HTTP, Redis and CLI/node process tests pass, including adversarial traversal with
+identical hand-checked totals for **1, 2 and 3 participating nodes** and concurrent
+overlapping jobs. Final demo/release documentation and rehearsal remain pending.
 
 ## Development setup
 
@@ -509,8 +510,9 @@ Therefore each URL has one ownership interval and at most one contribution,
 completion cannot precede delayed discoveries, and final totals do not depend on
 worker interleaving. There is no re-fetch/recovery path. Failure is explicitly not
 a completed crawl. Real host-run node tests below connect this protocol to HTTP
-fetching; user-CLI process tests cover the same reads/submission boundary. Broader
-adversarial end-to-end and node-count comparison evidence remains separate work.
+fetching; user-CLI process tests cover the same reads/submission boundary. The
+adversarial distributed suite below checks the whole path with real requests and
+hand-calculated results for several node counts.
 
 ## Running nodes and lifecycle
 
@@ -623,7 +625,7 @@ The real-Redis integration tests are **opt-in** and ignored by `cargo test`.
 `scripts/redis-smoke.sh` starts a fresh Redis 7.4 Alpine container on an automatically
 allocated **loopback-only** port, waits for internal PONG and host TCP/PING readiness
 with bounded read-only polling (Docker forwarding can lag on WSL), runs the real
-CLI check and ignored connectivity/job/frontier/node-process/user-CLI tests, and removes
+CLI check and ignored connectivity/job/frontier/node-process/user-CLI/distributed tests, and removes
 only its own container/temp metadata on success or failure. Docker startup and Cargo
 subprocesses have finite limits. It never calls `FLUSHDB`/`FLUSHALL` or touches
 another container. Cleanup failures are reported as failures with the owned
@@ -688,9 +690,9 @@ These Unix process tests additionally require `kill` and GNU `timeout`. Each cas
 has the shared 30-second deadline/owned-key cleanup; node/fixture polling is bounded
 to five seconds, node exit to ten. RAII kills/reaps only owned child processes on
 failure before Redis cleanup; normal tests use graceful signals and await drain.
-The fetcher suite separately establishes non-HTML early cancellation and encoding
-boundaries. Broader adversarial traversal, identical totals for several N values,
-and physical multi-host networking remain later integration/manual work.
+The fetcher suite separately establishes encoding boundaries. The distributed suite
+below adds broader traversal, node-count equivalence and actual-node non-HTML
+cancellation; physical multi-host networking remains unverified.
 
 `tests/cli_jobs.rs` adds eight opt-in cases using independent real user-command
 processes, the same isolated Redis harness, and actual nodes/gated HTTP where
@@ -704,6 +706,69 @@ stats (3 files, 2 extensions, 4 words from 5 URL attempts) and retention after n
 exit; global namespace placement/precedence/isolation; safe later-submission and
 corrupt-read errors preserving printed IDs and stored data; and actual protocol
 publication of empty results and full `u64::MAX` word totals read by the CLI.
+`tests/distributed/mod.rs` adds four end-to-end cases, compiled as a submodule of
+`cli_jobs` to reuse its command/process helpers rather than duplicate a harness.
+These run automatically in the smoke script and CI, not in the default unit pass:
+
+- **N = 1, 2, 3, fresh state each time:** eight concurrent actual `submit` processes
+  return one identity. A seed/first-wave gate proves every started node actually
+  owns received GETs. The graph covers converging/cyclic and fragment links,
+  relative/query/base resolution, noscript/template/srcset resources, all five
+  redirect statuses, chains/convergence/loops, foreign and outside targets,
+  403/404/410, MIME/suffix disagreement, extensionless binaries and word exclusions.
+  The last held HTML body leaves **28 processed, zero waiting, one in flight**;
+  follow stays running and no final stats appear until its late child is crawled.
+  Each run yields **20 files, 6 extensions, 37 words from 30 unique GETs**. A later
+  nested-base job legitimately repeats three shared URLs exactly once each, with
+  **3 files/6 words**. New CLI/node processes retain IDs/results after all nodes
+  exit; already-done follow exits immediately. Neither foreign nor outside targets
+  receive requests, and each job's Redis discovery set matches its exact scope.
+- **Concurrent overlapping jobs for N = 1, 2, 3:** held HTTP bodies are correlated
+  with Redis URL/worker ownership across both jobs. Every process holds exactly
+  ten requests; completing one body admits exactly one new GET. Both jobs advance.
+  Cluster-wide graceful drain starts no new GETs, publishes owned results and
+  leaves queued work for fresh nodes. Final per-job totals/discovery sets and
+  aggregate request multiplicities prove shared URLs occur once per job, not once
+  globally or twice within one job. Cluster peaks are exactly **10, 20, 30**;
+  stable gated ownership proves the per-node bound without test-only HTTP headers.
+- **Non-HTML streaming through the real node:** ten blocked header responses fill
+  the budget; twelve ZIPs each advertise 100 MiB and never release their body-tail
+  gates. The node closes those sockets, advances queued HTML and finishes with
+  **14 files (`html: 2`, `zip: 12`), 4 words**, using one GET per URL. Some buffered
+  bytes may arrive; this proves no deliberate full-body consumption, not zero bytes.
+- **Two-node operational failure:** both processes own a job when a gated 503
+  fails it. Late peer HTML completions cannot add children/contributions or reopen
+  the frozen failure; both nodes drain and exit nonzero without query leaks. An
+  already-owned healthy job still finishes. Follow/stats report failure, no final
+  partial totals appear, and a replacement node does not retry/reopen the failed job.
+
+The adversarial fixture's totals are deliberately hand-checkable:
+
+| Existing files | Count | Words |
+| --- | ---: | ---: |
+| HTML seed | 1 | 15 = 2 title + 2 ordinary + 2 noscript + 3 punctuation + 3 split text nodes + 3 entity-separated |
+| Other two-word HTML bodies (left/right/shared, sub/late/final, two queries, MIME DAT, intro, template) | 11 | 22 |
+| Zero-word files (plain HTML suffix, extensionless binary, 204, base HTML, JPG, JPEG, PDF, CSS) | 8 | 0 |
+| **Total** | **20** | **37** |
+
+Extensions are **html: 15; css/dat/jpeg/jpg/pdf: 1 each**. Seven redirect URLs and
+three broken/inaccessible URLs are processed but not files, accounting for all
+30 unique attempts. The seed is `tests/fixtures/distributed-index.html`; the
+remaining explicit responses and exact eligible paths are in the test module.
+Run only these four cases against an already isolated Redis with:
+
+```sh
+CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
+  cargo test --locked --test cli_jobs distributed:: -- --ignored
+```
+
+Each fresh-state case uses the same 30-second deadline/owned-key cleanup (the N
+comparison tests run three such cases sequentially). Gates drive milestones, not
+lucky sleeps; polling is bounded to five seconds and process exits to ten. The
+existing node/HTTP suites exercise request deadlines, transfer failures and normal
+HTTP absence in the same full verification run. Abrupt kills, Redis loss and
+ambiguous-write recovery are explicitly unsupported, not passing recovery tests.
+
 `tests/support/process.rs` captures bounded stdout/stderr incrementally so tests
 observe flushed updates, bounds waits to five seconds/exits to ten, and kills/reaps
 only owned children on assertion/deadline before Redis namespace cleanup.

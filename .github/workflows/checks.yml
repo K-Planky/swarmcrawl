@@ -23,5 +23,5 @@ jobs:
         run: cargo test --locked
       - name: Locked build
         run: cargo build --locked
-      - name: Real Docker Redis smoke check
+      - name: Real Docker Redis and distributed process checks
         run: bash scripts/redis-smoke.sh
