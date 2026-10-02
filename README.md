@@ -13,9 +13,9 @@ create or delete keys. Crawling, jobs, `node`, `submit`, `status`, and `stats` a
 Prerequisites:
 
 - [Rustup](https://rustup.rs/) and a normal platform C linker/build toolchain.
-  `rust-toolchain.toml` selects Rust **1.97**, minimal profile, rustfmt and Clippy.
-  This release series supports edition 2024; local verification used Rust/Cargo
-  **1.97.1**. Rustup installs the selected toolchain when invoked in this repository.
+  `rust-toolchain.toml` pins Rust **1.99.0**, minimal profile, rustfmt and Clippy.
+  `Cargo.toml` requires Rust **1.99.0** or newer; the project uses edition 2024.
+  Rustup installs the pinned toolchain when invoked in this repository.
 - Docker with a reachable running daemon. Only Redis runs in Docker, not the Rust
   binary. On Windows/WSL, start Docker Desktop and enable integration for the distro;
   a Windows `docker.exe` on PATH alone does not establish a usable Linux daemon.
