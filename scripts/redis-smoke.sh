@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only checks against a fresh Docker Redis, with only owned-container cleanup.
+# Connectivity and job-contract checks in a fresh Redis; only owned-state cleanup.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -70,4 +70,4 @@ if [[ "$ready" != true ]]; then
 fi
 
 timeout 180s cargo run --locked -- check
-timeout 180s cargo test --locked --test redis_connectivity -- --ignored
+timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs -- --ignored

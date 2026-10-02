@@ -3,10 +3,12 @@
 A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-run
 binary is named `crawl`; the Cargo package and library remain `swarmcrawl`.
 
-**Current capability:** development foundation and tested URL/HTML/statistics
-library policies. `crawl --help`, `--version`, and `check` work. `check` connects to
-Redis and sends a read-only PING; it does not create or delete keys. Crawling, jobs,
-`node`, `submit`, `status`, and `stats` are **not implemented yet**.
+**Current capability:** development foundation, tested URL/HTML/statistics
+policies, and library-level Redis job submission/storage/read contracts.
+`crawl --help`, `--version`, and `check` work. `check` sends a read-only Redis PING;
+it does not create or delete keys. HTTP fetching, worker ownership/completion,
+and the `node`, `submit`, `status`, and `stats` CLI commands are **not implemented
+yet**. Library submission creates a queued seed, but nothing consumes it yet.
 
 ## Development setup
 
@@ -52,8 +54,9 @@ cargo run --locked -- check
 Expect `PONG` from redis-cli and `Redis connectivity: OK (PONG)` from `crawl`.
 If Redis is not ready yet, retry the read-only check; each `crawl check` is bounded
 by its configured timeout. It exits nonzero on failure and never prints success
-first. This container uses disposable state with persistence disabled. Future job
-results need only last until Redis is cleared or shut down, not across shutdown.
+first. This container uses disposable state with persistence disabled. Job identities
+and results have no TTL and last until Redis is cleared or shut down; persistence
+across shutdown is not required.
 
 Cleanup targets only this development container:
 
@@ -80,7 +83,7 @@ after selection, so an overridden invalid environment value does not cause failu
 | Option | Environment | Default | Contract |
 | --- | --- | --- | --- |
 | `--redis-url` | `CRAWL_REDIS_URL` | `redis://127.0.0.1:6379/0` | TCP Redis URL; port 1–65535, nonnegative database, optional username/password |
-| `--redis-timeout-secs` | `CRAWL_REDIS_TIMEOUT_SECS` | `5` | Integer 1–60; one deadline for connection setup and PING combined |
+| `--redis-timeout-secs` | `CRAWL_REDIS_TIMEOUT_SECS` | `5` | Integer 1–60; one deadline for check connection+PING; library job storage uses it for connection setup and each operation |
 
 Examples with no credentials:
 
@@ -98,16 +101,17 @@ category, not raw URLs, server error messages, or credentials. Success goes to s
 and errors to stderr. Exit codes: `0` success/help/version, `1` configuration or
 connectivity failure, `2` command-line syntax/usage errors.
 
-These are Redis-check settings, **not HTTP-fetch timeouts**. HTTP timeout/status
+These are Redis settings, **not HTTP-fetch timeouts**. HTTP timeout/status
 policies will be defined with the fetcher. The node-wide maximum of ten requests
-is a requirement, not an option to raise. Job namespaces/keys will be defined with
-job storage; no unused settings or placeholder crawl commands are exposed now.
+is a requirement, not an option to raise. The library job store uses the same
+validated `RedisConfig`; no unused CLI namespace settings or placeholder crawl
+commands are exposed now.
 
 ## Crawl domain policies
 
 These contracts are implemented in the library and tested without network access;
-no worker uses them yet. HTTP outcomes/timeouts/decoding and Redis coordination are
-still future work.
+no worker uses them yet. HTTP outcomes/timeouts/decoding and worker coordination
+are still future work.
 
 ### URL identity and scope
 
@@ -187,7 +191,95 @@ and never uses floats.
 A file contribution presupposes unique ownership and an existing successful file;
 missing/redirect responses must not contribute, and non-HTML files pass zero words.
 The domain alone does not determine existence or enforce cluster ownership. Redis
-numeric encoding/decoding remains to be implemented with checked conversions.
+job reads validate these same invariants and parse decimal integers exactly, with
+checked range validation (see below).
+
+## Redis job storage and read contracts
+
+The library exposes `jobs::JobStore::{connect, submit, snapshot, stats}`. It uses
+an async multiplexed connection and the shared `RedisConfig`, with a deadline for
+connection setup and each operation. `submit` accepts a validated `CrawlUrl`; it
+returns a `Submission { job, created }` without waiting for any worker. Job IDs
+are namespace-local positive decimal integers (`1`, `2`, …), capped at Redis's
+signed sequence maximum `9223372036854775807`. They are stable, not random secrets
+or URL hashes. IDs can have gaps after detected orphan-key corruption.
+
+The default namespace is **`swarmcrawl:v1`**. All future commands/nodes must share
+that namespace and Redis database. `connect_in_namespace` allows isolated library
+tests/deployments (1–128 ASCII letters, digits, `:`, `_`, `-`); it is not a CLI
+option. Use exclusive, nonoverlapping namespaces. Schema v1 is strict, with no
+migration or automatic reset of incompatible/corrupt data. Redis Cluster is not
+supported; coordination uses the assignment's single Redis instance.
+
+With prefix `P` and job ID `J`:
+
+| Key | Redis type | Meaning |
+| --- | --- | --- |
+| `P:submissions` | hash | canonical base URL → retained job ID |
+| `P:next-job-id` | string | signed Redis `INCR` sequence |
+| `P:active` | set | IDs available to future worker scheduling |
+| `P:job:J:meta` | hash | `schema=1`, canonical `base`, `state`, `processed`, `failure` |
+| `P:job:J:seen` | set | unique canonical discovered URLs, including seed |
+| `P:job:J:frontier` | list | discovered URLs waiting for ownership |
+| `P:job:J:in-flight` | hash | owned URL → owner identity (future worker protocol) |
+| `P:job:J:stats` | hash | `num_files`, `num_exts`, `total_word_count` aggregates |
+| `P:job:J:extensions` | hash | lowercase extension → positive file count |
+
+Empty Redis collections are absent keys (e.g. initial in-flight/extensions).
+No job key/identity/result expires. There is no public delete/reset API; do not
+clear a shared Redis to reset tests. Tests remove only their unique namespaces.
+Job base URLs/queries are stored verbatim after canonicalization: Redis must be
+trusted/private, and neither diagnostics nor Debug output should expose them.
+
+### Atomic submission
+
+One small `EVAL` transition checks the canonical submission hash first. An existing
+base returns its retained ID, including for a completed or failed job, without
+adding another seed or restarting it. A new base gets a sequence ID, running
+metadata, seen seed, one frontier entry, zero statistics, submission mapping and
+active membership together. All clients use this same transition; no local lock
+or separate coordinator is involved. It creates work even with no nodes running.
+The script reads the sequence back as a decimal string after `INCR`; it never uses
+Lua's floating-point reply as an ID, so IDs above `2^53` remain exact.
+
+Redis scripts are serialized but **do not roll back on errors**. Shared key types,
+sequence range and new-job key absence are checked before initialization. A
+preexisting job-key collision can consume a sequence ID only; it never creates a
+new submission identity or a partial seed. Invalid data is surfaced, not deleted.
+Infrastructure loss/resource exhaustion during writes is outside the baseline;
+a timeout may mean a write took effect. No automatic retry or crash recovery is
+implemented. Idempotent resubmission under a healthy Redis still returns the same ID.
+
+### Progress, state and statistics reads
+
+A single `MULTI/EXEC` reads metadata, seen cardinality, frontier length, in-flight
+length and both statistics hashes. No worker write can interleave those reads.
+The snapshot reports:
+
+- `processed`: unique finished URL attempts, including broken links and redirects;
+  this is the future CLI's **crawled** count, not HTML pages or successful files.
+- `frontier`, `in_flight`, `discovered`: waiting URLs, owned URLs, and all discovered
+  URLs. Validate `discovered = processed + frontier + in_flight` with checked sums.
+- `successful_files`: existing files only, at most `processed`, from the aggregate.
+- `state`: `running`, `done`, or `failed` with a fixed `fetch`, `statistics`, or
+  `protocol` failure category. Running requires outstanding work; done requires
+  an empty frontier and no owners. Failed may retain outstanding diagnostic state
+  and can never supply final statistics; stopping/draining is future protocol work.
+
+Submission starts at `(discovered, processed, frontier, in_flight, successful_files)
+= (1, 0, 1, 0, 0)`. Unknown jobs report an explicit error. Invalid metadata, key
+shapes, canonical URLs, state combinations or statistics are rejected with safe
+operation/field categories, not raw Redis error messages or stored values.
+All stored counters/totals are canonical unsigned decimal strings: no negative,
+signed, padded, fractional or exponential forms. Reads preserve the target's full
+`usize` and `u64` ranges, including words above `i64::MAX`, and reject overflow.
+
+`stats` returns validated `WebStats` **only for done jobs**; running and failed jobs
+return distinct errors rather than partial statistics. Its state/result reads are
+coherent, but this does not yet guarantee correct *publication*. Unique claiming,
+link publication, at-most-once contribution and automatic finalization still need
+the atomic worker protocol. That protocol must publish aggregates and done together;
+empty frontier alone must never be treated as completion.
 
 ## Quality gates and tests
 
@@ -202,9 +294,9 @@ bash scripts/redis-smoke.sh
 ```
 
 Default tests require no external Redis: domain policy and checked-arithmetic
-unit tests, library configuration/redaction checks, a local silent TCP peer for
-the check deadline, and actual CLI processes for help/version, validation,
-configuration precedence, and credential redaction. The silent peer tests timeout
+unit tests, library configuration/redaction checks, local silent TCP peers for
+the check/job-connection deadlines, and actual CLI processes for help/version,
+validation, configuration precedence, and credential redaction. The silent peer tests timeout
 behavior only, not Redis compatibility.
 
 `tests/domain_policies.rs` combines the domain contracts using two HTML fixtures
@@ -214,24 +306,35 @@ duplicates, outside links, a broken link, MIME/suffix disagreement and an
 extensionless non-HTML file. This is static domain verification, **not** evidence
 of HTTP fetching, Redis deduplication or a working distributed crawler.
 
-The real-Redis integration test is **opt-in** and is ignored by `cargo test`.
+The real-Redis integration tests are **opt-in** and ignored by `cargo test`.
 `scripts/redis-smoke.sh` starts a fresh Redis 7.4 Alpine container on an automatically
 allocated **loopback-only** port, waits for PONG with bounded polling, runs the real
-CLI check and ignored integration test, and removes only its own container/temp
-metadata on success or failure. Docker startup and Cargo subprocesses have finite
-limits. It never calls `FLUSHDB`/`FLUSHALL` or touches another container. Cleanup
-failures are reported as failures with the owned container ID for manual removal.
+CLI check and ignored connectivity/job-contract tests, and removes only its own
+container/temp metadata on success or failure. Docker startup and Cargo
+subprocesses have finite limits. It never calls `FLUSHDB`/`FLUSHALL` or touches
+another container. Cleanup failures are reported as failures with the owned
+container ID for manual removal.
 
 For an already isolated Redis, the equivalent opt-in invocation is:
 
 ```sh
 CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --test redis_connectivity -- --ignored
+  cargo test --locked --test redis_connectivity --test redis_jobs -- --ignored
 ```
 
-This test only sends PING; later coordination/process tests will need unique
-namespaces and test-owned key cleanup. A default test pass is **not** evidence of
-Docker/Redis verification or distributed crawl correctness. GitHub CI passed for
+The connectivity test only sends PING. `tests/redis_jobs.rs` uses unique namespaces
+and deletes only their keys after success or assertion failure. Seven tests check:
+32 independently connected racing submissions; four independent submission
+processes released through a Redis gate; different-base isolation and retention;
+exact final-result fixture reads through `u64::MAX`; invalid/schema/overflow
+rejection; ID precision above `2^53`, exhaustion and orphan-key handling; coherent
+snapshots during concurrent fixture transactions; and cleanup after an intentional
+panic while preserving another namespace. Each case is bounded to 30 seconds,
+cleanup to 10 seconds, and submission subprocesses are killed/reaped on failure.
+The nested panic in the cleanup test is expected, not a suppressed product failure.
+Completed/failed states are **test fixtures**, not a worker implementation or proof
+of automatic completion. A default test pass is **not** evidence of Docker/Redis
+verification or distributed crawl correctness. GitHub CI passed for
 the development foundation; the workflow runs the same gates for new commits.
 
 Optional shell checks:
@@ -247,6 +350,8 @@ shellcheck scripts/redis-smoke.sh
   no Redis schema or network policy lives in CLI parsing.
 - `src/config.rs`: validated shared Redis settings and typed, secret-safe errors.
 - `src/redis.rs`: async multiplexed Redis connectivity and bounded read-only check.
+- `src/jobs.rs`, `src/jobs/submit.lua`: typed job IDs/states, bounded async Redis
+  storage, atomic submission/seed initialization and transactional validated reads.
 - `src/urls.rs`: canonical HTTP(S) identity, resolution, scope and path extensions.
 - `src/html.rs`: MIME classification, full synchronous link/text extraction.
 - `src/stats.rs`: required `WebStats` and validated checked aggregation.
@@ -254,17 +359,17 @@ shellcheck scripts/redis-smoke.sh
   CLI/Redis integration checks; `.github/workflows/checks.yml` runs the local gates
   on Ubuntu.
 
-Use Rust naming conventions and direct domain-specific modules/functions. Add job
-storage, HTTP fetching and node orchestration modules only when they implement
-real contracts. Libraries expose typed `Result` errors;
-the CLI reports them once at the boundary. There is no logging framework yet;
-worker diagnostics must later add safe job/node/operation context without exposing
+Use Rust naming conventions and direct domain-specific modules/functions. Add HTTP
+fetching and node orchestration modules only when they implement real contracts.
+Libraries expose typed `Result` errors; the CLI reports them once at the boundary.
+There is no logging framework yet; worker diagnostics must later add safe job/node/operation context without exposing
 URL credentials, sensitive query values, or Redis credentials. Add dependencies
 only for implemented needs: Clap for command parsing, Tokio for async work/deadlines,
-Redis's Tokio support for the current check, `url` for identity/scope and `scraper`
+Redis's Tokio support for the check/job store, `url` for identity/scope and `scraper`
 for HTML extraction. Direct `html5ever` access configures scraper's parser with
 scripting disabled; it adds no second parser. HTTP dependencies wait for fetching.
-Redis default features (including scripts) are off until needed.
+Redis default features remain off; submission uses direct `EVAL`, not the optional
+script-cache helper, so no extra script/hash dependency is needed.
 
 Baseline crash recovery, cancellation, robots/politeness, and JavaScript rendering
 remain excluded by the assignment. A working connectivity check does not implement
