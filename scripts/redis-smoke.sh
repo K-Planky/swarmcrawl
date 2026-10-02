@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Redis protocol/application-node checks; only owned-state cleanup.
+# Redis protocol/application-node/user-CLI checks; only owned-state cleanup.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -87,4 +87,4 @@ if [[ "$host_ready" != true ]]; then
 fi
 
 timeout 180s cargo run --locked -- check
-timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process -- --ignored
+timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process --test cli_jobs -- --ignored

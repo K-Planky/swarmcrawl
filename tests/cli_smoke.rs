@@ -25,7 +25,18 @@ fn help_and_version_work_without_redis() {
     let help = text(&help.stdout);
     assert!(help.contains("check"));
     assert!(help.contains("--redis-url"));
-    assert!(help.contains("node"));
+    for name in ["node", "submit", "status", "stats"] {
+        assert!(help.contains(name));
+    }
+    assert!(help.contains("--namespace"));
+    for name in ["submit", "status", "stats"] {
+        let output = crawl(&[name, "--help"], &[]);
+        assert!(output.status.success());
+        assert!(text(&output.stdout).contains("--namespace"));
+    }
+    let status_help = crawl(&["status", "--help"], &[]);
+    assert!(text(&status_help.stdout).contains("--follow"));
+    assert!(text(&status_help.stdout).contains("500 ms"));
     let node_help = crawl(&["node", "--help"], &[]);
     assert!(node_help.status.success());
     assert!(text(&node_help.stdout).contains("--fetch-timeout-secs"));
@@ -64,6 +75,19 @@ fn help_hides_redis_environment_value() {
     );
     assert!(output.status.success());
     assert!(!text(&output.stdout).contains("test-secret"));
+    for args in [
+        vec!["--help"],
+        vec!["submit", "--help"],
+        vec!["status", "--help"],
+        vec!["stats", "--help"],
+    ] {
+        let output = crawl(
+            &args,
+            &[("CRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace")],
+        );
+        assert!(output.status.success());
+        assert!(!text(&output.stdout).contains("fixture-sensitive-namespace"));
+    }
 }
 
 #[test]
@@ -107,6 +131,54 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
     let output = crawl(&[], &[]);
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("Usage:"));
+    for args in [
+        vec!["submit"],
+        vec!["status"],
+        vec!["status", "-f"],
+        vec!["stats"],
+    ] {
+        let output = crawl(&args, &[]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(text(&output.stderr).contains("Usage:"));
+    }
+}
+
+#[test]
+fn job_validation_precedes_network_access_and_never_echoes_inputs() {
+    let endpoint = [("CRAWL_REDIS_URL", "redis://127.0.0.1:1/0")];
+    let output = crawl(
+        &[
+            "submit",
+            "https://example.org/valid/",
+            "https://user:fixture-secret@example.org/?token=fixture-query",
+        ],
+        &endpoint,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = text(&output.stderr);
+    assert!(error.contains("submit input 2"));
+    assert!(error.contains("no URLs submitted"));
+    assert!(!error.contains("fixture-"));
+    for command in ["status", "stats"] {
+        let output = crawl(&[command, "fixture-sensitive-id"], &endpoint);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = text(&output.stderr);
+        assert!(error.contains("invalid job ID"));
+        assert!(!error.contains("fixture-sensitive-id"));
+    }
+    for args in [
+        vec!["submit", "https://example.org/"],
+        vec!["status", "1"],
+        vec!["status", "-f", "1"],
+        vec!["stats", "1"],
+    ] {
+        let output = crawl(&args, &[("CRAWL_JOB_NAMESPACE", "invalid namespace")]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(text(&output.stderr).contains("invalid job namespace"));
+    }
 }
 
 #[test]

@@ -1,3 +1,5 @@
+mod commands;
+
 use std::{error::Error, process::ExitCode};
 
 use clap::{Parser, Subcommand};
@@ -39,6 +41,16 @@ struct Cli {
     )]
     redis_timeout_secs: String,
 
+    /// Shared job namespace (all nodes and job commands must use the same one)
+    #[arg(
+        long,
+        global = true,
+        env = "CRAWL_JOB_NAMESPACE",
+        default_value = DEFAULT_JOB_NAMESPACE,
+        hide_env_values = true
+    )]
+    namespace: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -58,15 +70,34 @@ enum Command {
             hide_env_values = true
         )]
         fetch_timeout_secs: String,
+    },
 
-        /// Shared job namespace (all nodes and submitters must use the same one)
-        #[arg(
-            long,
-            env = "CRAWL_JOB_NAMESPACE",
-            default_value = DEFAULT_JOB_NAMESPACE,
-            hide_env_values = true
-        )]
-        namespace: String,
+    /// Submit one job per URL and return IDs without waiting for nodes
+    #[command(
+        long_about = "Submit one job per URL without waiting for nodes. All URLs are validated before any submission; an invalid input rejects the whole batch. Repeated canonical URLs return retained IDs. Output identifies inputs by position, never by potentially sensitive URL."
+    )]
+    Submit {
+        /// Absolute HTTP(S) seed/base URLs (one job each; fragments ignored)
+        #[arg(required = true, num_args = 1.., value_name = "URL")]
+        urls: Vec<String>,
+    },
+
+    /// Read a coherent progress snapshot; -f polls until done or failed
+    Status {
+        /// Poll every 500 ms and print changes until terminal; Ctrl-C exits 130
+        #[arg(short = 'f', long)]
+        follow: bool,
+
+        /// Namespace-local positive decimal job ID
+        #[arg(value_name = "JOB")]
+        job: String,
+    },
+
+    /// Print final WebStats with sorted extensions (only for done jobs)
+    Stats {
+        /// Namespace-local positive decimal job ID
+        #[arg(value_name = "JOB")]
+        job: String,
     },
 }
 
@@ -83,17 +114,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             check_connection(&config).await?;
             println!("Redis connectivity: OK (PONG)");
         }
-        Command::Node {
-            fetch_timeout_secs,
-            namespace,
-        } => {
+        Command::Node { fetch_timeout_secs } => {
             let fetch_timeout_secs = fetch_timeout_secs
                 .parse::<u64>()
                 .map_err(|_| ConfigError::InvalidFetchTimeout)?;
             let fetcher = Fetcher::new(FetchConfig::new(fetch_timeout_secs)?)?;
             let shutdown = shutdown_signal()?;
-            let store = JobStore::connect_in_namespace(&config, &namespace).await?;
+            let store = JobStore::connect_in_namespace(&config, &cli.namespace).await?;
             run_node(store, fetcher, shutdown).await?;
+        }
+        Command::Submit { urls } => {
+            let bases = commands::validate_urls(&urls)?;
+            let store = JobStore::connect_in_namespace(&config, &cli.namespace).await?;
+            commands::submit(&store, &bases).await?;
+        }
+        Command::Status { job, follow } => {
+            let job = job.parse()?;
+            let store = JobStore::connect_in_namespace(&config, &cli.namespace).await?;
+            commands::status(&store, job, follow).await?;
+        }
+        Command::Stats { job } => {
+            let job = job.parse()?;
+            let store = JobStore::connect_in_namespace(&config, &cli.namespace).await?;
+            commands::stats(&store, job).await?;
         }
     }
     Ok(())
@@ -105,7 +148,14 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::FAILURE
+            if matches!(
+                error.downcast_ref::<commands::CommandError>(),
+                Some(commands::CommandError::Interrupted)
+            ) {
+                ExitCode::from(130)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

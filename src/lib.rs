@@ -1,5 +1,5 @@
 //! Testable crawl policies, bounded HTTP fetching, and atomic Redis job coordination.
-//! Host-run nodes connect these contracts; user job commands are separate CLI work.
+//! Host-run nodes connect these contracts; user commands use only the Redis job API.
 
 pub mod config;
 pub mod fetch;
