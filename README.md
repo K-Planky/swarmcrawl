@@ -14,7 +14,8 @@ HTTP, Redis and CLI/node process tests pass, including adversarial traversal wit
 identical hand-checked totals for **1, 2 and 3 participating nodes** and concurrent
 overlapping jobs. A [deterministic live-demo runbook](demo/README.md) supplies two
 local jobs, exact expected totals, three-node operation and owned-state reset.
-Final clean-checkout auditing and owner-controlled demo/release actions are separate.
+The [final technical audit](#final-technical-audit) passed from a fresh checkout;
+owner-controlled demo/release actions remain separate.
 
 ## Start here
 
@@ -855,6 +856,50 @@ bash -n scripts/redis-smoke.sh
 shellcheck scripts/redis-smoke.sh
 ```
 
+## Final technical audit
+
+**Audited candidate:** `f8adc4356b52a42458995d032a7352679e5bb54c`, on
+**2026-10-03**. The audit reviewed the full submission → ownership → fetch/parse →
+publication → completion path; no runtime, schema or dependency changes were needed.
+This evidence describes that candidate, not an automatic guarantee for later changes.
+
+A fresh clone containing only committed files, with no `target/` or Redis state,
+passed the [complete quality gates](#quality-gates-and-tests): locked build,
+formatting, strict Clippy, **59 default tests**, **35 opt-in real-Docker Redis/process
+tests**, and **3 Python fixture tests**. Redis/process checks were repeated with fresh
+containers. Setup, help/version and the default development Redis/PING instructions
+also passed. Commands ran with a cleared environment containing only `HOME`, `PATH`
+and `LANG`, plus the explicit demo settings from the runbook. The installed Rust
+compiler/toolchain and Cargo registry cache were reused; this was not a cold-cache
+or toolchain-installation test.
+
+| Technical contract | Passing evidence |
+| --- | --- |
+| Rust/Tokio source, locked build and consistent CLI configuration | Quality gates, help/version and configuration/precedence/redaction tests |
+| Full reachable HTML traversal, in-base safety, URL identity and redirects | Domain/HTTP tests and adversarial request logs, including zero foreign/outside requests |
+| Existing files, broken-link exclusion, MIME-based HTML, words/extensions and exact `WebStats` | Hand-counted fixtures, non-HTML body cancellation, checked arithmetic and full-range Redis/CLI round trips |
+| N ≥ 1 host nodes, one Docker Redis and Redis-only user commands | Independent node/CLI processes, no-node submission and fresh-checkout setup |
+| Idempotent submission, one GET/contribution per URL per job and independent jobs | Concurrent submission/discovery/publication races and overlapping-job request multiplicities |
+| Concurrent node work with ≤10 active requests across jobs/body lifetime | Gated N=1/2/3 runs, per-worker ownership and single-body slot admission |
+| Coherent progress/follow, no premature completion, immediately readable retained stats | Delayed final discovery, publication/read races, follow exit and fresh-process reads after drain/restart |
+| Same answer for any tested node count; explicit failure/lifecycle boundary | N=1/2/3 hand-checked equality, HTTP timeout/503 tests, SIGINT/SIGTERM drain and frozen-failure checks |
+
+The [three-node runbook](demo/README.md) was rehearsed **twice**, resetting both the
+owned disposable Redis and HTTP server between runs. Each rehearsal showed two
+queued jobs, retained duplicate IDs, **30 held bodies (ten per node)**, running-only
+stats rejection, follow completion and exact **30 files / 4 extensions / 81 words
+per job**. Each site recorded **64 eligible GETs, each exactly once**, zero
+outside/unexpected requests and zero gate expirations. Results/IDs remained readable
+after all nodes exited; normal cleanup removed only owned processes/containers.
+
+Environment: Linux WSL2 x86_64, Rust/Cargo **1.99.0**, Docker client/engine **29.8.0**,
+Redis **7.4.11** (`redis:7.4-alpine`), Python **3.12.3**. Shell syntax/ShellCheck and
+local documentation link/example checks passed. Physical multi-host networking,
+non-Unix shutdown and peer comparison remain unverified. Crash/Redis-loss/ambiguous
+write recovery remains excluded, not a hidden completed feature. The helper, live
+demo, grading tag, post-demo publication and LMS submission still require the
+[owner actions below](#owner-demo-and-hand-in-checklist).
+
 ## Source organization and conventions
 
 - `src/main.rs`: Clap presentation, shared configuration-source selection, command
@@ -931,12 +976,14 @@ this agent session; the owner can compare notes separately.
 This is a release checklist, **not a claim that external actions have occurred**.
 Technical final-audit evidence and owner confirmations must be recorded separately.
 
-- [ ] Confirm the individual GitHub repository is **private until after the demo**;
-  keep descriptive commits and the working branch's history intact.
+- [x] Confirm the individual GitHub repository is **private until after the demo**:
+  `K-Planky/swarmcrawl` was verified **PRIVATE** during the 2026-10-03 audit.
+  Keep it private until the demo and preserve descriptive commits/working history.
 - [ ] Arrange another person to help on demo day; share [the runbook](demo/README.md),
   terminal roles, expected output, release timing and safe reset instructions.
-- [ ] Run the complete quality/real-Redis suite and rehearse from a fresh checkout.
-  Reset the disposable demo and repeat; use several live nodes plus the CLI.
+- [x] Run the complete quality/real-Redis suite and rehearse from a fresh checkout.
+  The [technical audit](#final-technical-audit) passed, including two reset-separated
+  rehearsals with three live nodes plus the CLI. Rerun for later code changes.
 - [ ] Select the verified grading commit and create the **exact tag `1.0.0`**. Check
   for an existing local/remote tag first; never overwrite/move a shared tag. Tagging
   is an explicit owner-approved release action, not an automatic normal push.
