@@ -1,7 +1,8 @@
-//! Versioned Redis jobs: atomic identity/seed creation and coherent read contracts.
-//!
-//! Workers and final publication belong to the frontier protocol, not this module's
-//! current API. Stored integers are canonical decimal strings, never Lua floats.
+//! Versioned Redis jobs: atomic submission, ownership/publication and coherent reads.
+//! Stored integers are canonical decimal strings, never Lua floats.
+
+mod frontier;
+pub use frontier::{Completion, PageResult, WorkClaim, WorkerId};
 
 use std::{collections::HashMap, error::Error, fmt, future::Future, str::FromStr, time::Duration};
 
@@ -166,7 +167,7 @@ impl JobStore {
 
     /// Never expose running/failed aggregates as final WebStats. The final-state
     /// and result reads share a single transaction; publication must be atomic too
-    /// (the S04 worker protocol), not an out-of-band finalization step.
+    /// (the frontier protocol), not an out-of-band finalization step.
     pub async fn stats(&self, job: JobId) -> Result<WebStats, StoreError> {
         let (snapshot, stats) = self.read(job).await?;
         match snapshot.state {
@@ -323,6 +324,8 @@ fn decimal<T: FromStr>(value: &str, field: &'static str) -> Result<T, StoreError
 pub enum StoreError {
     InvalidNamespace,
     InvalidJobId,
+    InvalidWorkerId,
+    OwnershipMismatch,
     UnknownJob,
     NotFinished,
     JobFailed(JobFailure),
@@ -351,6 +354,8 @@ impl fmt::Display for StoreError {
         match self {
             Self::InvalidNamespace => f.write_str("invalid job namespace; use 1–128 ASCII letters, digits, colons, underscores or hyphens"),
             Self::InvalidJobId => f.write_str("invalid job ID; use a positive decimal integer at most 9223372036854775807"),
+            Self::InvalidWorkerId => f.write_str("invalid worker identity; use 1–128 ASCII letters, digits, underscores or hyphens"),
+            Self::OwnershipMismatch => f.write_str("claim ownership mismatch; stop publication and investigate protocol state"),
             Self::UnknownJob => f.write_str("unknown job; verify its ID, Redis database and namespace"),
             Self::NotFinished => f.write_str("job is still running; final statistics are not available"),
             Self::JobFailed(reason) => write!(f, "job failed ({reason:?}); final statistics are not available"),

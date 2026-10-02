@@ -4,11 +4,12 @@ A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-
 binary is named `crawl`; the Cargo package and library remain `swarmcrawl`.
 
 **Current capability:** development foundation, tested URL/HTML/statistics
-policies, and library-level Redis job submission/storage/read contracts.
-`crawl --help`, `--version`, and `check` work. `check` sends a read-only Redis PING;
-it does not create or delete keys. HTTP fetching, worker ownership/completion,
-and the `node`, `submit`, `status`, and `stats` CLI commands are **not implemented
-yet**. Library submission creates a queued seed, but nothing consumes it yet.
+policies, and library-level Redis submission, ownership, atomic publication and
+validated read contracts. `crawl --help`, `--version`, and `check` work. `check`
+sends a read-only Redis PING; it does not create or delete keys. HTTP fetching,
+node orchestration and the `node`, `submit`, `status`, and `stats` CLI commands
+are **not implemented yet**. Library consumers can claim and publish page outcomes,
+but no application worker fetches or consumes jobs yet.
 
 ## Development setup
 
@@ -110,8 +111,8 @@ commands are exposed now.
 ## Crawl domain policies
 
 These contracts are implemented in the library and tested without network access;
-no worker uses them yet. HTTP outcomes/timeouts/decoding and worker coordination
-are still future work.
+no worker uses them yet. HTTP outcomes/timeouts/decoding and worker scheduling
+are still future work; Redis ownership/publication is implemented below.
 
 ### URL identity and scope
 
@@ -133,8 +134,8 @@ are still future work.
   Resolving alone does not authorize fetching. Use the first non-template
   `<base href>` throughout the page; an invalid first base falls back to the page
   URL, not a later base. An external base can resolve references but cannot expand
-  job scope. Fragment variants deduplicate locally; global deduplication is not
-  implemented yet.
+  job scope. Fragment variants deduplicate locally; the Redis protocol also
+  deduplicates discoveries globally within each job.
 - URL Debug output and typed errors do not expose URLs or query values. Full
   canonical strings are available explicitly for storage/requests, not logs.
 
@@ -196,8 +197,9 @@ checked range validation (see below).
 
 ## Redis job storage and read contracts
 
-The library exposes `jobs::JobStore::{connect, submit, snapshot, stats}`. It uses
-an async multiplexed connection and the shared `RedisConfig`, with a deadline for
+The library exposes `jobs::JobStore::{connect, submit, snapshot, stats}` plus the
+frontier operations described below. It uses an async multiplexed connection and
+the shared `RedisConfig`, with a deadline for
 connection setup and each operation. `submit` accepts a validated `CrawlUrl`; it
 returns a `Submission { job, created }` without waiting for any worker. Job IDs
 are namespace-local positive decimal integers (`1`, `2`, …), capped at Redis's
@@ -217,11 +219,11 @@ With prefix `P` and job ID `J`:
 | --- | --- | --- |
 | `P:submissions` | hash | canonical base URL → retained job ID |
 | `P:next-job-id` | string | signed Redis `INCR` sequence |
-| `P:active` | set | IDs available to future worker scheduling |
+| `P:active` | set | Running job IDs available to worker scheduling |
 | `P:job:J:meta` | hash | `schema=1`, canonical `base`, `state`, `processed`, `failure` |
 | `P:job:J:seen` | set | unique canonical discovered URLs, including seed |
 | `P:job:J:frontier` | list | discovered URLs waiting for ownership |
-| `P:job:J:in-flight` | hash | owned URL → owner identity (future worker protocol) |
+| `P:job:J:in-flight` | hash | owned URL → worker identity |
 | `P:job:J:stats` | hash | `num_files`, `num_exts`, `total_word_count` aggregates |
 | `P:job:J:extensions` | hash | lowercase extension → positive file count |
 
@@ -264,7 +266,8 @@ The snapshot reports:
 - `state`: `running`, `done`, or `failed` with a fixed `fetch`, `statistics`, or
   `protocol` failure category. Running requires outstanding work; done requires
   an empty frontier and no owners. Failed may retain outstanding diagnostic state
-  and can never supply final statistics; stopping/draining is future protocol work.
+  and can never supply final statistics. Failure freezes outstanding diagnostic
+  state; future nodes must stop claiming that job and drain their network tasks.
 
 Submission starts at `(discovered, processed, frontier, in_flight, successful_files)
 = (1, 0, 1, 0, 0)`. Unknown jobs report an explicit error. Invalid metadata, key
@@ -276,10 +279,84 @@ signed, padded, fractional or exponential forms. Reads preserve the target's ful
 
 `stats` returns validated `WebStats` **only for done jobs**; running and failed jobs
 return distinct errors rather than partial statistics. Its state/result reads are
-coherent, but this does not yet guarantee correct *publication*. Unique claiming,
-link publication, at-most-once contribution and automatic finalization still need
-the atomic worker protocol. That protocol must publish aggregates and done together;
-empty frontier alone must never be treated as completion.
+coherent with the atomic publisher below; there is no separate finalization step.
+An empty frontier with owned work remains running.
+
+## Atomic frontier protocol
+
+The worker protocol extends the schema above; HTTP fetching and node orchestration
+are separate future steps. Its correctness rests on these invariants:
+
+1. Within a job, each canonical URL is in `seen` exactly once. Every seen URL is
+   either waiting, owned by exactly one worker, or processed:
+   `|seen| = processed + |frontier| + |in-flight|`.
+2. Claiming atomically moves one waiting URL into `in-flight`, without changing
+   `seen` or `processed`. Only a matching ownership token can publish that claim.
+   There is no lease, reclaim or requeue path.
+3. Completion validates ownership and arithmetic **before** changing collections.
+   It adds unseen in-scope children to both `seen` and the frontier, contributes
+   at most one file, removes the parent owner and increments `processed` in one
+   Redis script. No observer can see the parent released without its children.
+4. The same script marks `done` and removes active membership only when both the
+   frontier and in-flight hash are empty. Aggregates are already stored when done
+   becomes visible, so a new reader can immediately obtain final `WebStats`.
+5. Done/failed states never return to running. Failures retain diagnostic state,
+   remove active membership and never expose partial aggregates as final results.
+   Redis interruption/ambiguous writes and abrupt worker loss remain unsupported.
+
+Redis serializes each script across processes; local mutexes are not involved.
+Submission and all worker mutations must use this protocol, not direct key writes.
+The implemented library API is:
+
+- `active_jobs()`: sorted advisory IDs. Another worker can finish a listed job;
+  the claim operation always rechecks its state.
+- `claim(job, worker)`: atomically move the next FIFO URL to ownership and return
+  a private-field `WorkClaim` containing the job/base/URL/worker/namespace. Worker
+  IDs are caller-selected 1–128 ASCII letters/digits/underscores/hyphens; nodes
+  must choose a fresh identity at startup and share the same Redis/database.
+  `None` means no waiting work **now**, including for terminal jobs; it is not
+  proof that a running job is finished. Unknown IDs are explicit errors.
+- `complete(claim, PageResult, discoveries)`: `File { html_word_count }` contributes
+  one file using the **claimed URL's** extension; `NoFile` contributes no statistics
+  (broken response or redirect). Either may publish discoveries. Rust filters
+  canonical typed URLs by same-origin/base-prefix scope and deduplicates the input;
+  Redis `SADD` deduplicates across all processes. Only the fetcher can establish
+  existence/MIME and decide which outcome is appropriate.
+- `fail(claim, reason)`: terminal fetch/statistics/protocol failure for a still-owned
+  claim. Preserve queued/owned work and partial aggregates for diagnosis, without
+  processing the failed parent. Already-owned tasks can finish their network work
+  but publication returns the retained failure and makes no changes. No new claims,
+  links, contributions or restart are allowed; partial stats never become final.
+
+Publication returns `Published { done }`, `AlreadyCompleted`, or `Failed(reason)`.
+Repeating a published claim is a safe no-op, even with a different outcome/links;
+wrong ownership or namespace is an error, never another contribution. Claims are
+not serialized or transferred between workers. Clones can use the same claim, but
+only the first successful publication changes state. This guards application-level
+repeated completion; it does **not** provide recovery from ambiguous network writes.
+Do not automatically retry a Redis timeout or transport error.
+
+The scripts preflight key types, schema, progress/numeric aggregate invariants, active
+membership, ownership and required arithmetic before writes. Invalid storage is
+an error, not a reset. Exact decimal digit addition preserves the full unsigned
+word/file ranges (and checks the target's `usize` bound); whole totals never pass
+through Lua `tonumber` or signed Redis increments. Overflow atomically marks a
+statistics failure **without** publishing children, releasing the parent or
+partially changing totals. Redis collection cardinalities beyond Lua's exact
+integer range (`2^53 - 1`) are explicitly rejected rather than rounded. This limit
+is on collection sizes, not on word totals or job IDs.
+
+Under healthy Redis/nodes/network and exclusive protocol writes, submission
+establishes the invariants; claiming preserves their partition; completion extends
+it only through atomic unseen-child admission and one parent-to-processed move.
+Since every future discovery must come from a current owner, empty frontier **and**
+no owners means no publisher can produce more work. The final contribution and
+terminal state are in the same script, serialized with transactional readers.
+Therefore each URL has one ownership interval and at most one contribution,
+completion cannot precede delayed discoveries, and final totals do not depend on
+worker interleaving. There is no re-fetch/recovery path. Failure is explicitly not
+a completed crawl. This is a Redis protocol proof/test boundary, not yet evidence
+of actual HTTP fetching or an end-to-end distributed crawler.
 
 ## Quality gates and tests
 
@@ -309,7 +386,7 @@ of HTTP fetching, Redis deduplication or a working distributed crawler.
 The real-Redis integration tests are **opt-in** and ignored by `cargo test`.
 `scripts/redis-smoke.sh` starts a fresh Redis 7.4 Alpine container on an automatically
 allocated **loopback-only** port, waits for PONG with bounded polling, runs the real
-CLI check and ignored connectivity/job-contract tests, and removes only its own
+CLI check and ignored connectivity/job/frontier tests, and removes only its own
 container/temp metadata on success or failure. Docker startup and Cargo
 subprocesses have finite limits. It never calls `FLUSHDB`/`FLUSHALL` or touches
 another container. Cleanup failures are reported as failures with the owned
@@ -319,11 +396,12 @@ For an already isolated Redis, the equivalent opt-in invocation is:
 
 ```sh
 CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --test redis_connectivity --test redis_jobs -- --ignored
+  cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier -- --ignored
 ```
 
-The connectivity test only sends PING. `tests/redis_jobs.rs` uses unique namespaces
-and deletes only their keys after success or assertion failure. Seven tests check:
+The connectivity test only sends PING. `tests/support/mod.rs` shares an isolated
+namespace/cleanup harness for both Redis suites, deleting only test-owned keys
+after success or assertion failure. Seven tests in `tests/redis_jobs.rs` check:
 32 independently connected racing submissions; four independent submission
 processes released through a Redis gate; different-base isolation and retention;
 exact final-result fixture reads through `u64::MAX`; invalid/schema/overflow
@@ -332,10 +410,24 @@ snapshots during concurrent fixture transactions; and cleanup after an intention
 panic while preserving another namespace. Each case is bounded to 30 seconds,
 cleanup to 10 seconds, and submission subprocesses are killed/reaped on failure.
 The nested panic in the cleanup test is expected, not a suppressed product failure.
-Completed/failed states are **test fixtures**, not a worker implementation or proof
-of automatic completion. A default test pass is **not** evidence of Docker/Redis
-verification or distributed crawl correctness. GitHub CI passed for
-the development foundation; the workflow runs the same gates for new commits.
+Completed/failed states in the storage-read suite are **test fixtures**; the frontier
+suite separately tests their actual production.
+
+Seven tests in `tests/redis_frontier.rs` check 32 concurrent parent discoveries;
+32 competing claimers for two shared children; 32 publications of the same claim
+with one contribution; a gated last parent publishing children while another job
+finishes independently; empty valid results and overlapping per-job URLs; coherent
+reads during actual publication; immediate final reads by a racing independent
+reader; exact addition through `u64::MAX` and fail-closed overflow (including a
+small test-only file-count bound using the real script); fixed failure categories
+and terminal freezing; preflight key/numeric/ownership/namespace/scope corruption;
+and four gated independent processes claiming/publishing a convergent graph with
+25 unique child ownerships and hand-checked totals (26 files, one extension,
+77 words). Process cleanup and case deadlines match the storage suite.
+These use **mock page outcomes**, not an HTTP server or application node binary;
+HTTP at-most-once retrieval/concurrency and full CLI evidence remain future work.
+A default test pass is **not** evidence of Docker/Redis or distributed crawl
+verification. CI runs the same gates for new commits.
 
 Optional shell checks:
 
@@ -352,6 +444,9 @@ shellcheck scripts/redis-smoke.sh
 - `src/redis.rs`: async multiplexed Redis connectivity and bounded read-only check.
 - `src/jobs.rs`, `src/jobs/submit.lua`: typed job IDs/states, bounded async Redis
   storage, atomic submission/seed initialization and transactional validated reads.
+- `src/jobs/frontier.rs`, `src/jobs/{protocol,claim,complete}.lua`: typed ownership
+  API, scope filtering, preflight/exact decimal arithmetic, and atomic claiming,
+  publication, failure and finalization.
 - `src/urls.rs`: canonical HTTP(S) identity, resolution, scope and path extensions.
 - `src/html.rs`: MIME classification, full synchronous link/text extraction.
 - `src/stats.rs`: required `WebStats` and validated checked aggregation.
@@ -372,5 +467,5 @@ Redis default features remain off; submission uses direct `EVAL`, not the option
 script-cache helper, so no extra script/hash dependency is needed.
 
 Baseline crash recovery, cancellation, robots/politeness, and JavaScript rendering
-remain excluded by the assignment. A working connectivity check does not implement
-any cluster deduplication, completion, or final-statistics guarantees.
+remain excluded by the assignment. A working connectivity check alone does not
+exercise the library's cluster ownership, completion or final-statistics guarantees.
