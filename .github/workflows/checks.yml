@@ -23,5 +23,7 @@ jobs:
         run: cargo test --locked
       - name: Locked build
         run: cargo build --locked
+      - name: Demo fixture controls
+        run: python3 -B -m unittest discover -s demo -p 'test_*.py'
       - name: Real Docker Redis and distributed process checks
         run: bash scripts/redis-smoke.sh

@@ -11,7 +11,22 @@ are immediately readable by a new CLI process and retained after nodes exit.
 `crawl --help`, `--version`, and the read-only Redis `check` also work. Domain,
 HTTP, Redis and CLI/node process tests pass, including adversarial traversal with
 identical hand-checked totals for **1, 2 and 3 participating nodes** and concurrent
-overlapping jobs. Final demo/release documentation and rehearsal remain pending.
+overlapping jobs. A [deterministic live-demo runbook](demo/README.md) supplies two
+local jobs, exact expected totals, three-node operation and owned-state reset.
+Final clean-checkout auditing and owner-controlled demo/release actions are separate.
+
+## Start here
+
+1. Follow [development setup](#development-setup) and [start Redis](#start-a-development-redis).
+2. For a repeatable presentation, use **[demo/README.md](demo/README.md)**. It starts
+   a supplied gated local site and three host nodes; no public Internet is needed.
+3. For your own target, launch [N nodes](#running-nodes-and-lifecycle), then
+   [submit, follow and read stats](#user-job-commands) from any Redis-connected host.
+
+Reference: [configuration](#cli-configuration), [work flow](#how-the-components-fit-together),
+[URL/text policies](#crawl-domain-policies), [atomic coordination](#atomic-frontier-protocol),
+[tests](#quality-gates-and-tests), [source map](#source-organization-and-conventions),
+[owner hand-in checklist](#owner-demo-and-hand-in-checklist).
 
 ## Development setup
 
@@ -76,7 +91,27 @@ host's reachable IP, not its own loopback address, and run `crawl check` from ea
 host. Do not expose Redis to the public Internet or disable security protections.
 The current build supports plain TCP `redis://` only, not TLS (`rediss://`) or Unix
 sockets; credentials on plaintext TCP require a trusted isolated network.
-Physical multi-host connectivity has not been verified yet.
+Physical multi-host connectivity has not been verified yet. For an actual multi-host
+setup:
+
+1. On the Redis host, keep its ACL/password configuration **outside the repository**
+   with restrictive file permissions. Use a Docker bind mount for that configuration
+   and start `redis-server` with its mounted path; do not put passwords on the command
+   line. Publish `TRUSTED_REDIS_IP:6379:6379`, where the IP belongs to a private host
+   interface, rather than the loopback binding in the development command.
+2. Allow TCP 6379 through that host's firewall **only from the intended node/CLI
+   hosts**. Keep Redis protected mode/authentication enabled. A namespace is state
+   isolation, not access control; every Redis client is trusted.
+3. Build the same revision on each node/CLI host. Supply `CRAWL_REDIS_URL` externally
+   with the Redis host's reachable address and configured authentication. Use the
+   same Redis database and `CRAWL_JOB_NAMESPACE` on every client; verify `crawl check`
+   from each machine before starting host-run nodes.
+4. Submit a target reachable from **every node**, not a node's loopback HTTP address.
+   Redis hosts do not need access to the website, and nodes need no inbound crawler
+   port. The supplied demo server intentionally cannot serve other hosts.
+
+Do not change repository visibility or claim physical multi-host verification just
+because multiple processes on one host pass.
 
 ## CLI configuration
 
@@ -184,6 +219,30 @@ namespace. Invalid IDs are rejected before connecting; unknown IDs suggest check
 that configuration. Redis and CLI output errors are nonzero, not success messages.
 Only the `node` command creates an HTTP fetcher or executes crawler work. There is
 no direct CLI-to-node connection and no job cancellation/reset command.
+
+## How the components fit together
+
+```text
+CLI submit/status/stats ──────► one Redis (Docker)
+                                  ▲  ▲  ▲
+                                  │  │  │ atomic ownership/publication
+                              host crawler nodes (Tokio)
+                                  │
+                                  ▼ one scope-checked GET per owned URL
+                              HTTP(S) targets
+```
+
+The CLI has no node or target connection. Redis owns submission identity, each
+job's seen/frontier/owners, coherent progress and retained statistics. Nodes are
+interchangeable; a rotating scheduler admits at most ten owned tasks across all
+jobs, using one shared asynchronous fetcher budget through response-body lifetime.
+Synchronous HTML parsing returns owned data before any subsequent await. The
+fetcher reports an outcome and links; only the Redis publisher may contribute a
+file or enqueue discoveries. Completion publishes children **before releasing the
+parent in the same atomic script**, and marks done only with zero waiting work and
+zero owners. Final statistics already exist at that instant. See the
+[protocol invariants and completion argument](#atomic-frontier-protocol) for the
+precise boundary and numeric safeguards.
 
 ## Crawl domain policies
 
@@ -775,7 +834,18 @@ only owned children on assertion/deadline before Redis namespace cleanup.
 A default test pass is **not** evidence of Docker/Redis or distributed crawl
 verification. CI runs the same gates for new commits.
 
-Optional shell checks:
+The presentation fixture also has dependency-free Python control/body-gate checks
+and a static Rust hand-count oracle (`tests/demo_policies.rs`). These are not a
+replacement for process-level distributed evidence. Python 3.10+ is needed only
+for the demo and its checks, not for the crawler or existing Redis suite:
+
+```sh
+python3 -B -m unittest discover -s demo -p 'test_*.py'
+cargo test --locked --test demo_policies
+```
+
+CI runs the Python fixture checks too. `-B` avoids generating Python bytecode in the
+source tree. Optional shell checks:
 
 ```sh
 bash -n scripts/redis-smoke.sh
@@ -827,3 +897,51 @@ script-cache helper, so no extra script/hash dependency is needed.
 Baseline crash recovery, cancellation, robots/politeness, and JavaScript rendering
 remain excluded by the assignment. A working connectivity check alone does not
 exercise the library's cluster ownership, completion or final-statistics guarantees.
+
+## Manual sites and peer comparison
+
+The local fixtures are the automated correctness oracle. For supplementary manual
+checks, choose a few small, bounded HTTP(S) bases, submit them in a separate namespace
+and use a finite node HTTP deadline. Inspect their links/scope before retrieval;
+this crawler has no robots/politeness system. An interrupted follow is not cancellation,
+and a transport failure is not a completed partial crawl. Public content, availability,
+TLS and network paths can change, so do not encode public totals as tests. Compare
+policies/results with a classmate when available; peer comparison is advice, not a
+substitute for the protocol tests. Do not publish URLs containing private queries.
+
+Supplementary observations on **2026-10-03**, using a fresh isolated namespace,
+one host node, a 10-second HTTP deadline and a 30-second follow bound per job:
+
+| Base | Observed files | Extensions | Words |
+| --- | ---: | --- | ---: |
+| `https://example.com/` | 2 | html 1, js 1 | 27 |
+| `https://example.org/` | 2 | html 1, js 1 | 27 |
+| `https://httpbin.org/html` | 1 | html 1 | 604 |
+
+All three reached done, new CLI processes read final stats, and nodes drained
+normally. These are time-specific smoke observations, **not expected public-site
+answers** or a comprehensive HTTPS audit. Peer comparison was not available in
+this agent session; the owner can compare notes separately.
+
+## Owner demo and hand-in checklist
+
+This is a release checklist, **not a claim that external actions have occurred**.
+Technical final-audit evidence and owner confirmations must be recorded separately.
+
+- [ ] Confirm the individual GitHub repository is **private until after the demo**;
+  keep descriptive commits and the working branch's history intact.
+- [ ] Arrange another person to help on demo day; share [the runbook](demo/README.md),
+  terminal roles, expected output, release timing and safe reset instructions.
+- [ ] Run the complete quality/real-Redis suite and rehearse from a fresh checkout.
+  Reset the disposable demo and repeat; use several live nodes plus the CLI.
+- [ ] Select the verified grading commit and create the **exact tag `1.0.0`**. Check
+  for an existing local/remote tag first; never overwrite/move a shared tag. Tagging
+  is an explicit owner-approved release action, not an automatic normal push.
+- [ ] Perform the live demo with the helper and several host-run crawler processes.
+- [ ] **After** the live demo, make the repository public and verify graders can
+  access source, Cargo files/lockfile, Redis setup and README/runbook.
+- [ ] Submit the repository URL on the course LMS and retain confirmation.
+
+No crash-recovery challenge, browser rendering, cancellation or politeness system
+is required for the baseline. Demo readiness does not imply that the live demo,
+visibility change, grading tag or LMS delivery is finished.
