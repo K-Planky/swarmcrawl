@@ -5,7 +5,9 @@ fn crawl(args: &[&str], env: &[(&str, &str)]) -> Output {
     command
         .args(args)
         .env_remove("CRAWL_REDIS_URL")
-        .env_remove("CRAWL_REDIS_TIMEOUT_SECS");
+        .env_remove("CRAWL_REDIS_TIMEOUT_SECS")
+        .env_remove("CRAWL_FETCH_TIMEOUT_SECS")
+        .env_remove("CRAWL_JOB_NAMESPACE");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -23,7 +25,11 @@ fn help_and_version_work_without_redis() {
     let help = text(&help.stdout);
     assert!(help.contains("check"));
     assert!(help.contains("--redis-url"));
-    assert!(help.contains("crawling is not implemented yet"));
+    assert!(help.contains("node"));
+    let node_help = crawl(&["node", "--help"], &[]);
+    assert!(node_help.status.success());
+    assert!(text(&node_help.stdout).contains("--fetch-timeout-secs"));
+    assert!(text(&node_help.stdout).contains("--namespace"));
 
     let version = crawl(&["--version"], &[]);
     assert!(version.status.success());
@@ -101,4 +107,37 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
     let output = crawl(&[], &[]);
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("Usage:"));
+}
+
+#[test]
+fn node_settings_are_validated_redacted_and_flags_override_environment() {
+    for value in ["0", "301", "fixture-sensitive-value"] {
+        let output = crawl(&["node", "--fetch-timeout-secs", value], &[]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(text(&output.stderr).contains("HTTP timeout must be between 1 and 300 seconds"));
+        assert!(!text(&output.stderr).contains("fixture-sensitive-value"));
+    }
+    let output = crawl(
+        &[
+            "node",
+            "--fetch-timeout-secs",
+            "1",
+            "--namespace",
+            "has space",
+        ],
+        &[("CRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("invalid job namespace"));
+    assert!(!text(&output.stderr).contains("fixture-sensitive-value"));
+
+    let output = crawl(
+        &["node", "--help"],
+        &[
+            ("CRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value"),
+            ("CRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace"),
+        ],
+    );
+    assert!(output.status.success());
+    assert!(!text(&output.stdout).contains("fixture-sensitive-"));
 }

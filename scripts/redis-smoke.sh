@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Connectivity/job/frontier checks in a fresh Redis; only owned-state cleanup.
+# Redis protocol/application-node checks; only owned-state cleanup.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -54,7 +54,7 @@ if [[ ! "$mapping" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
     exit 1
 fi
 export CRAWL_REDIS_URL="redis://${mapping}/0"
-unset CRAWL_REDIS_TIMEOUT_SECS
+unset CRAWL_REDIS_TIMEOUT_SECS CRAWL_FETCH_TIMEOUT_SECS CRAWL_JOB_NAMESPACE
 
 ready=false
 for ((attempt = 0; attempt < 50; attempt++)); do
@@ -69,5 +69,22 @@ if [[ "$ready" != true ]]; then
     exit 1
 fi
 
+# An in-container PONG does not establish that Docker's host TCP forwarding is
+# ready (observed on WSL). Retry only this read-only setup probe, never job writes.
+timeout 180s cargo build --locked
+host_ready=false
+for ((attempt = 0; attempt < 20; attempt++)); do
+    if probe=$(timeout 3s ./target/debug/crawl --redis-timeout-secs 1 check 2>&1); then
+        host_ready=true
+        break
+    fi
+    printf 'Waiting for test Redis host mapping: %s\n' "$probe" >&2
+    sleep 0.1
+done
+if [[ "$host_ready" != true ]]; then
+    printf 'Test Redis host address did not become reachable in the bounded setup poll.\n' >&2
+    exit 1
+fi
+
 timeout 180s cargo run --locked -- check
-timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier -- --ignored
+timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process -- --ignored

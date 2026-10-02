@@ -89,6 +89,28 @@ pub enum Completion {
 }
 
 impl JobStore {
+    /// Allocate a fresh process identity across hosts using the shared namespace.
+    /// Retain the sequence with the job state; never retry an ambiguous write.
+    pub async fn allocate_worker(&self) -> Result<WorkerId, StoreError> {
+        let reply: Vec<String> = bounded(
+            self.timeout,
+            "allocate worker identity",
+            redis::cmd("EVAL")
+                .arg(include_str!("worker.lua"))
+                .arg(1)
+                .arg(self.key("next-worker-id"))
+                .query_async(&mut self.connection.clone()),
+        )
+        .await?;
+        match reply.as_slice() {
+            [kind, identity] if kind == "worker" => identity
+                .parse()
+                .map_err(|_| StoreError::InvalidData("allocated worker identity")),
+            [kind] if kind == "exhausted" => Err(StoreError::WorkerSequenceExhausted),
+            _ => Err(StoreError::InvalidData("worker identity sequence")),
+        }
+    }
+
     /// Advisory scheduling snapshot. Jobs can become terminal after this read;
     /// claim rechecks state atomically. No scheduler or HTTP task is started here.
     pub async fn active_jobs(&self) -> Result<Vec<JobId>, StoreError> {

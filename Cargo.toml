@@ -18,7 +18,7 @@ mime = "0.3.17"
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip"] }
 scraper = { version = "0.27.0", default-features = false }
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]

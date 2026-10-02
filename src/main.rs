@@ -2,7 +2,13 @@ use std::{error::Error, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use swarmcrawl::{
-    config::{ConfigError, DEFAULT_REDIS_TIMEOUT_SECS, DEFAULT_REDIS_URL, RedisConfig},
+    config::{
+        ConfigError, DEFAULT_FETCH_TIMEOUT_SECS, DEFAULT_REDIS_TIMEOUT_SECS, DEFAULT_REDIS_URL,
+        FetchConfig, RedisConfig,
+    },
+    fetch::Fetcher,
+    jobs::{DEFAULT_JOB_NAMESPACE, JobStore},
+    node::{run_node, shutdown_signal},
     redis::check_connection,
 };
 
@@ -10,7 +16,7 @@ use swarmcrawl::{
 #[command(
     name = "crawl",
     version,
-    about = "Distributed crawler foundation (crawling is not implemented yet)"
+    about = "Redis-coordinated distributed crawler"
 )]
 struct Cli {
     /// Redis TCP URL (prefer the environment variable for credentials)
@@ -23,7 +29,7 @@ struct Cli {
     )]
     redis_url: String,
 
-    /// Total Redis check timeout in seconds (1-60)
+    /// Redis connection/operation timeout in seconds (1-60)
     #[arg(
         long,
         global = true,
@@ -41,6 +47,27 @@ struct Cli {
 enum Command {
     /// Check Redis connectivity with a read-only PING
     Check,
+
+    /// Run a crawler node; Ctrl-C/SIGTERM stops claims and drains owned work
+    Node {
+        /// Total HTTP request timeout in seconds (1-300)
+        #[arg(
+            long,
+            env = "CRAWL_FETCH_TIMEOUT_SECS",
+            default_value_t = DEFAULT_FETCH_TIMEOUT_SECS.to_string(),
+            hide_env_values = true
+        )]
+        fetch_timeout_secs: String,
+
+        /// Shared job namespace (all nodes and submitters must use the same one)
+        #[arg(
+            long,
+            env = "CRAWL_JOB_NAMESPACE",
+            default_value = DEFAULT_JOB_NAMESPACE,
+            hide_env_values = true
+        )]
+        namespace: String,
+    },
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
@@ -55,6 +82,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Check => {
             check_connection(&config).await?;
             println!("Redis connectivity: OK (PONG)");
+        }
+        Command::Node {
+            fetch_timeout_secs,
+            namespace,
+        } => {
+            let fetch_timeout_secs = fetch_timeout_secs
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidFetchTimeout)?;
+            let fetcher = Fetcher::new(FetchConfig::new(fetch_timeout_secs)?)?;
+            let shutdown = shutdown_signal()?;
+            let store = JobStore::connect_in_namespace(&config, &namespace).await?;
+            run_node(store, fetcher, shutdown).await?;
         }
     }
     Ok(())

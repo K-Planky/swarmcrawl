@@ -3,13 +3,13 @@
 A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-run
 binary is named `crawl`; the Cargo package and library remain `swarmcrawl`.
 
-**Current capability:** development foundation, tested URL/HTML/statistics
-policies, bounded async HTTP fetching, and library-level Redis submission,
-ownership, atomic publication and validated read contracts. `crawl --help`,
-`--version`, and `check` work. `check` sends a read-only Redis PING; it does not
-create or delete keys. Node orchestration and the `node`, `submit`, `status`, and
-`stats` CLI commands are **not implemented yet**. Library consumers can fetch a
-URL or claim/publish work, but no application worker connects those components yet.
+**Current capability:** tested URL/HTML/statistics policies, bounded async HTTP
+fetching, atomic Redis coordination, and actual host-run `crawl node` processes.
+Nodes concurrently claim/fetch/publish work, stay available for later submissions,
+and drain owned work on graceful shutdown. `crawl --help`, `--version`, and the
+read-only Redis `check` also work. The `submit`, `status`, and `stats` **user CLI
+commands are not implemented yet**; job submission/read APIs exist in the library
+and are exercised by real-node integration tests. This is not yet the full CLI.
 
 ## Development setup
 
@@ -78,7 +78,7 @@ Physical multi-host connectivity has not been verified yet.
 
 ## Current CLI configuration
 
-Global options may appear before or after `check`. For each setting, precedence is
+Global Redis options may appear before or after `check` or `node`. Precedence is
 **explicit flag > environment variable > built-in default**. Values are validated
 after selection, so an overridden invalid environment value does not cause failure.
 
@@ -101,19 +101,27 @@ Never commit actual credentials. Help hides environment values; configuration
 Debug output redacts connection information; errors include a safe operation/error
 category, not raw URLs, server error messages, or credentials. Success goes to stdout
 and errors to stderr. Exit codes: `0` success/help/version, `1` configuration or
-connectivity failure, `2` command-line syntax/usage errors.
+runtime failure, `2` command-line syntax/usage errors. Nodes report safe PID/job/
+operation context to stderr and never log base URLs, request queries or Redis
+credentials. Node runtime errors exit nonzero only after draining other owned work.
 
-These are Redis settings, **not HTTP-fetch timeouts**. The library fetcher has a
-separate validated deadline described below; HTTP/node settings are not CLI flags
-yet. The node-wide maximum of ten requests is a requirement, not an option to
-raise. The library job store uses the same validated `RedisConfig`; no unused CLI
-namespace settings or placeholder crawl commands are exposed now.
+`node` additionally accepts these implemented settings with the same precedence:
+
+| Node option | Environment | Default | Contract |
+| --- | --- | --- | --- |
+| `--fetch-timeout-secs` | `CRAWL_FETCH_TIMEOUT_SECS` | `30` | Integer 1–300; total HTTP network deadline, separate from Redis deadlines |
+| `--namespace` | `CRAWL_JOB_NAMESPACE` | `swarmcrawl:v1` | 1–128 ASCII letters, digits, `:`, `_`, `-`; shared by every node and library submitter |
+
+The ten-request node-wide maximum is fixed, not an option to raise. Namespaces
+are for isolated deployments/tests, not random per-process identities. Use
+exclusive, nonoverlapping prefixes; never reset keys while nodes use them. `check`
+is only PING and does not access job namespaces. No placeholder job commands exist.
 
 ## Crawl domain policies
 
 These contracts are implemented in the library and tested independently of network
-access. The fetcher uses them with real local HTTP responses; application worker
-scheduling remains future work. Fetching and Redis coordination are described below.
+access. Fetchers and application nodes use these same contracts with real local
+HTTP responses. Fetching, Redis coordination and lifecycle are described below.
 
 ### URL identity and scope
 
@@ -205,7 +213,8 @@ before any request and returns `FetchOutcome { result: PageResult, discoveries }
 It does not claim, schedule, publish, retry, or remember URLs. The caller must own
 the URL first, then publish the outcome/discoveries through `JobStore::complete`.
 An operational error must instead fail the owned job; it is not an empty outcome.
-Connecting these interfaces into application nodes is the next integration step.
+`node::run_node` connects these interfaces without bypassing either ownership or
+the shared request budget.
 
 Each call issues **one GET**, never HEAD followed by GET. Automatic redirects and
 reqwest retries are disabled. HTTP/1 is used without idle connection reuse, avoiding
@@ -265,7 +274,7 @@ not count as files; successful eligible targets do, using their own extensions.
   parsing that might miss hyperlinks. HTML entities remain the parser's job.
 - `FetchError` keeps safe categories/status codes only, with no raw reqwest source,
   URL, Location, header value, credentials or query in Display/Debug. Node error
-  reporting must add safe job/node context when orchestration is implemented.
+  reporting adds safe job/PID context without copying network payloads or URLs.
 
 ## Redis job storage and read contracts
 
@@ -278,10 +287,10 @@ are namespace-local positive decimal integers (`1`, `2`, …), capped at Redis's
 signed sequence maximum `9223372036854775807`. They are stable, not random secrets
 or URL hashes. IDs can have gaps after detected orphan-key corruption.
 
-The default namespace is **`swarmcrawl:v1`**. All future commands/nodes must share
-that namespace and Redis database. `connect_in_namespace` allows isolated library
-tests/deployments (1–128 ASCII letters, digits, `:`, `_`, `-`); it is not a CLI
-option. Use exclusive, nonoverlapping namespaces. Schema v1 is strict, with no
+The default namespace is **`swarmcrawl:v1`**. All nodes and library submitters/readers
+must share that namespace and Redis database. `connect_in_namespace` and the node's
+`--namespace` allow isolated tests/deployments (1–128 ASCII letters, digits,
+`:`, `_`, `-`). Use exclusive, nonoverlapping namespaces. Schema v1 is strict, with no
 migration or automatic reset of incompatible/corrupt data. Redis Cluster is not
 supported; coordination uses the assignment's single Redis instance.
 
@@ -290,7 +299,8 @@ With prefix `P` and job ID `J`:
 | Key | Redis type | Meaning |
 | --- | --- | --- |
 | `P:submissions` | hash | canonical base URL → retained job ID |
-| `P:next-job-id` | string | signed Redis `INCR` sequence |
+| `P:next-job-id` | string | signed Redis `INCR` job sequence |
+| `P:next-worker-id` | string | retained atomic process-identity sequence, not a heartbeat or recovery lease |
 | `P:active` | set | Running job IDs available to worker scheduling |
 | `P:job:J:meta` | hash | `schema=1`, canonical `base`, `state`, `processed`, `failure` |
 | `P:job:J:seen` | set | unique canonical discovered URLs, including seed |
@@ -356,8 +366,8 @@ An empty frontier with owned work remains running.
 
 ## Atomic frontier protocol
 
-The worker protocol extends the schema above; bounded HTTP fetching is a separate
-component, and application node orchestration remains future work. Its correctness
+The worker protocol extends the schema above; the fetcher and node scheduler are
+separate components that use this same ownership/publication boundary. Its correctness
 rests on these invariants:
 
 1. Within a job, each canonical URL is in `seen` exactly once. Every seen URL is
@@ -385,8 +395,11 @@ The implemented library API is:
   the claim operation always rechecks its state.
 - `claim(job, worker)`: atomically move the next FIFO URL to ownership and return
   a private-field `WorkClaim` containing the job/base/URL/worker/namespace. Worker
-  IDs are caller-selected 1–128 ASCII letters/digits/underscores/hyphens; nodes
-  must choose a fresh identity at startup and share the same Redis/database.
+  IDs are 1–128 ASCII letters/digits/underscores/hyphens. Library callers can select
+  them; application nodes call `allocate_worker()` at startup, which atomically
+  increments a retained sequence and returns a fresh `node-<decimal>` identity
+  across hosts. The sequence is checked before mutation and read back as a string
+  for exact values above `2^53`. All nodes share the same Redis/database.
   `None` means no waiting work **now**, including for terminal jobs; it is not
   proof that a running job is finished. Unknown IDs are explicit errors.
 - `complete(claim, PageResult, discoveries)`: `File { html_word_count }` contributes
@@ -428,9 +441,70 @@ terminal state are in the same script, serialized with transactional readers.
 Therefore each URL has one ownership interval and at most one contribution,
 completion cannot precede delayed discoveries, and final totals do not depend on
 worker interleaving. There is no re-fetch/recovery path. Failure is explicitly not
-a completed crawl. This is a Redis protocol proof/test boundary, not evidence of
-an end-to-end distributed crawler. HTTP fetching is separately tested below;
-application-node integration still needs process-level verification.
+a completed crawl. Real host-run node tests below connect this protocol to HTTP
+fetching; the complete user CLI and broader end-to-end comparison suite remain
+separate integration work.
+
+## Running nodes and lifecycle
+
+Start the development Redis above, build once, and run each node directly on the
+host in its own terminal (not a crawler container):
+
+```sh
+cargo build --locked
+./target/debug/crawl node
+# Repeat in another terminal for N >= 1, or point each host at the same Redis:
+./target/debug/crawl --redis-url redis://127.0.0.1:6379/0 node
+# Optional HTTP deadline and shared deployment namespace:
+./target/debug/crawl node --fetch-timeout-secs 60 --namespace swarmcrawl:v1
+```
+
+A ready message on stderr means the node connected and allocated its identity.
+It polls the advisory active-job set every **100 ms when it has task capacity**,
+and refreshes immediately after owned tasks finish (a parent may make an idle job
+runnable). No inbound port or CLI-to-node connection exists. One sorted snapshot
+rotates after the last successfully claimed job, then claims one FIFO URL per job
+in round-robin order. Idle/terminal jobs leave that scheduling pass; refresh admits
+new work/jobs before refilling slots. An idle claim attempt does not move the
+fairness cursor. Refresh takes priority over ready candidates so an existing busy
+frontier cannot monopolize capacity while a different parent's children become
+ready. The next poll deadline starts after its Redis read, avoiding an overdue-poll
+loop with a slow healthy Redis.
+
+Each claimed URL immediately gets a Tokio task using the **one process-wide
+Fetcher**. There are at most ten owned tasks, including parsing and Redis
+publication, as well as the fetcher's ten-request cap through response-body
+lifetime. No unbounded pool of waiting tasks/claims exists. Successful outcomes
+and discoveries go through the same atomic `complete` transition; redirects and
+ordinary 4xx do not strand jobs. Nodes remain running after jobs finish, ready for
+later submissions. For now, only library callers/tests can submit/read jobs; the
+user CLI commands follow in the next implementation step.
+
+Press **Ctrl-C**, or send **SIGTERM on Unix**, to stop new claims and drain all
+owned tasks before exit. Shutdown never cancels a Redis claim/write midway: an
+already-started bounded claim may finish and gets its task drained too. Pending
+HTTP bodies finish or hit their configured deadline; discovered children are
+published even during drain but are left queued for another/new node. A second
+shutdown signal does not abort a Unix drain. Successful graceful exit is code 0;
+errors during drain produce code 1. Redis/job/result state has no expiry and needs
+no manual finalization or restart to read final library statistics.
+
+Unexpected HTTP/decoding/timeout errors first fail the owned job atomically, then
+stop that node's new claims, drain its remaining tasks and exit **1** with safe
+job/PID context. Word overflow is a statistics failure; invalid scope/internal
+budget state is a protocol failure. If another node already failed the job,
+publication retains that failure, never contributes partial final stats. Other
+owned healthy jobs can still publish while draining; queued healthy jobs can be
+finished by remaining/new nodes. Invalid Redis/protocol data, ambiguous Redis
+operations, task panics and signal-handler errors also stop claims and surface a
+nonzero error. Raw Redis messages and joined panic payloads are not copied into
+node errors; Rust's default panic hook still emits runtime diagnostics for an
+unsupported code panic. There is no automatic HTTP or Redis write retry.
+
+**Not crash recovery:** a forced kill, task panic, external cancellation of
+`run_node`, Redis loss, or an ambiguous coordination write can leave ownership
+stranded. Graceful draining does not reclaim those claims. Do not delete/reset a
+live namespace or promise resumability after these excluded failures.
 
 ## Quality gates and tests
 
@@ -480,9 +554,10 @@ cargo test --locked --test http_fetch
 
 The real-Redis integration tests are **opt-in** and ignored by `cargo test`.
 `scripts/redis-smoke.sh` starts a fresh Redis 7.4 Alpine container on an automatically
-allocated **loopback-only** port, waits for PONG with bounded polling, runs the real
-CLI check and ignored connectivity/job/frontier tests, and removes only its own
-container/temp metadata on success or failure. Docker startup and Cargo
+allocated **loopback-only** port, waits for internal PONG and host TCP/PING readiness
+with bounded read-only polling (Docker forwarding can lag on WSL), runs the real
+CLI check and ignored connectivity/job/frontier/node-process tests, and removes
+only its own container/temp metadata on success or failure. Docker startup and Cargo
 subprocesses have finite limits. It never calls `FLUSHDB`/`FLUSHALL` or touches
 another container. Cleanup failures are reported as failures with the owned
 container ID for manual removal.
@@ -491,12 +566,12 @@ For an already isolated Redis, the equivalent opt-in invocation is:
 
 ```sh
 CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
-  cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier -- --ignored
+  cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process -- --ignored
 ```
 
 The connectivity test only sends PING. `tests/support/mod.rs` shares an isolated
-namespace/cleanup harness for both Redis suites, deleting only test-owned keys
-after success or assertion failure. Seven tests in `tests/redis_jobs.rs` check:
+namespace/cleanup harness for Redis and node-process suites, deleting only
+test-owned keys after success or assertion failure. Seven tests in `tests/redis_jobs.rs` check:
 32 independently connected racing submissions; four independent submission
 processes released through a Redis gate; different-base isolation and retention;
 exact final-result fixture reads through `u64::MAX`; invalid/schema/overflow
@@ -519,9 +594,37 @@ and terminal freezing; preflight key/numeric/ownership/namespace/scope corruptio
 and four gated independent processes claiming/publishing a convergent graph with
 25 unique child ownerships and hand-checked totals (26 files, one extension,
 77 words). Process cleanup and case deadlines match the storage suite.
-These use **mock page outcomes**, not an HTTP server or application node binary;
-cluster-wide HTTP at-most-once retrieval, application-node concurrency and full CLI
-evidence remain future integration work. The local fetcher suite is separate.
+The frontier suite uses **mock page outcomes**, not an HTTP server or application
+node binary. The separate `tests/node_process.rs` suite has eight opt-in cases
+using the actual `crawl node` binary, real Redis and gated local HTTP:
+
+- Jobs submitted before and after startup, mixed HTML/image/404/redirect outcomes,
+  cycles/fragment duplicates and scope exclusion: 3 files, 2 extensions, 4 words
+  for the first job; 1 file/2 words for a later job without restarting the node.
+- Two concurrent jobs sharing exactly ten held HTTP bodies in one node: 15
+  files/30 words each, peak exactly ten, and unique request logs.
+- Two independent host processes owning ten bodies each on a convergent graph:
+  empty frontier plus 20 owners stays running, delayed links are published, shared
+  children deduplicate, and final results are 23 files/46 words with 23 unique GETs.
+- SIGTERM with ten owned bodies and queued work: stop claiming, survive a second
+  SIGINT, drain and publish a late child, then a fresh node finishes the remaining
+  work with 14 files/28 words and no duplicate GETs.
+- HTTP 503 fails a job, retains unavailable final stats, returns code 1 without
+  query secrets, drains a healthy job and does not restart the failed job.
+- A one-second HTTP timeout fails without retry or final partial statistics.
+- Redis key/protocol corruption stops the node nonzero, redacts payloads and does
+  not delete/reset the corrupt data.
+- Thirty-two racing fresh worker identities above `2^53`, retention across clients,
+  exact sequence values and fail-closed malformed/type/exhausted sequence handling.
+
+These Unix process tests additionally require `kill` and GNU `timeout`. Each case
+has the shared 30-second deadline/owned-key cleanup; node/fixture polling is bounded
+to five seconds, node exit to ten. RAII kills/reaps only owned child processes on
+failure before Redis cleanup; normal tests use graceful signals and await drain.
+The fetcher suite separately establishes non-HTML early cancellation and encoding
+boundaries. Full submit/status/stats CLI evidence, broader adversarial traversal,
+identical totals for several N values, and physical multi-host networking remain
+later integration/manual work.
 A default test pass is **not** evidence of Docker/Redis or distributed crawl
 verification. CI runs the same gates for new commits.
 
@@ -537,13 +640,16 @@ shellcheck scripts/redis-smoke.sh
 - `src/main.rs`: Clap presentation, configuration-source selection, exit behavior;
   no Redis schema or network policy lives in CLI parsing.
 - `src/config.rs`: validated Redis/HTTP deadlines and typed, secret-safe errors.
+- `src/node.rs`: bounded owned Tokio tasks, rotating job selection, safe failure
+  propagation, signal handling and stop-claiming/drain lifecycle.
 - `src/fetch.rs`: shared async client/request budget, scope-safe GET classification,
   explicit redirect discoveries, complete HTML decoding and operational errors.
 - `src/redis.rs`: async multiplexed Redis connectivity and bounded read-only check.
 - `src/jobs.rs`, `src/jobs/submit.lua`: typed job IDs/states, bounded async Redis
   storage, atomic submission/seed initialization and transactional validated reads.
-- `src/jobs/frontier.rs`, `src/jobs/{protocol,claim,complete}.lua`: typed ownership
-  API, scope filtering, preflight/exact decimal arithmetic, and atomic claiming,
+- `src/jobs/frontier.rs`, `src/jobs/{worker,protocol,claim,complete}.lua`: fresh
+  process identities, typed ownership, scope filtering, preflight/exact decimal
+  arithmetic, and atomic claiming,
   publication, failure and finalization.
 - `src/urls.rs`: canonical HTTP(S) identity, resolution, scope and path extensions.
 - `src/html.rs`: MIME classification, full synchronous link/text extraction.
@@ -552,11 +658,13 @@ shellcheck scripts/redis-smoke.sh
   CLI/Redis integration checks; `.github/workflows/checks.yml` runs the local gates
   on Ubuntu.
 
-Use Rust naming conventions and direct domain-specific modules/functions. Add node
-orchestration modules only when they implement real contracts.
-Libraries expose typed `Result` errors; the CLI reports them once at the boundary.
-There is no logging framework yet; worker diagnostics must later add safe job/node/operation context without exposing
-URL credentials, sensitive query values, or Redis credentials. Add dependencies
+Use Rust naming conventions and direct domain-specific modules/functions.
+Libraries expose typed `Result` errors; the CLI reports terminal errors at the
+boundary. No logging framework is needed: node stderr diagnostics include safe
+PID/job/operation context without URL credentials, sensitive queries or Redis
+credentials. Tokio's signal feature implements graceful shutdown (and adds its
+small signal registry/errno dependencies); no identity/scheduling framework is
+needed because Redis allocates process identities atomically. Add dependencies
 only for implemented needs: Clap for command parsing, Tokio for async work/deadlines,
 Redis's Tokio support for the check/job store, `url` for identity/scope and `scraper`
 for HTML extraction. Direct `html5ever` access configures scraper's parser with

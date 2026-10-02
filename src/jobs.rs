@@ -18,7 +18,7 @@ type StoredSnapshot = (Fields, u64, u64, u64, Fields, Fields);
 
 /// Namespace-local, monotonically allocated Redis IDs. They are not URLs/hashes
 /// and carry no secrets. Parsing rejects noncanonical or out-of-range IDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(u64);
 
 impl FromStr for JobId {
@@ -330,6 +330,7 @@ pub enum StoreError {
     NotFinished,
     JobFailed(JobFailure),
     SequenceExhausted,
+    WorkerSequenceExhausted,
     InvalidData(&'static str),
     Timeout {
         operation: &'static str,
@@ -360,6 +361,7 @@ impl fmt::Display for StoreError {
             Self::NotFinished => f.write_str("job is still running; final statistics are not available"),
             Self::JobFailed(reason) => write!(f, "job failed ({reason:?}); final statistics are not available"),
             Self::SequenceExhausted => f.write_str("job ID sequence is exhausted; select a new namespace for new jobs"),
+            Self::WorkerSequenceExhausted => f.write_str("worker identity sequence is exhausted; select a new namespace for new jobs and nodes"),
             Self::InvalidData(field) => write!(f, "invalid Redis job data ({field}); verify the schema and exclusive namespace use"),
             Self::Timeout { operation } => write!(f, "Redis {operation} timed out; verify the service and network; a write may have taken effect"),
             Self::Redis { operation, kind } => write!(f, "Redis {operation} failed ({kind:?}); verify the service, authentication and key types"),
