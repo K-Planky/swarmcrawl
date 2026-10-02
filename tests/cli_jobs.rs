@@ -70,7 +70,7 @@ async fn batch_submission_returns_without_nodes_and_cli_never_retrieves_targets(
         let mut submit = Process::with_env(
             &context,
             &["submit", a.as_str(), b.as_str(), &fragment],
-            &[("CRAWL_FETCH_TIMEOUT_SECS", "invalid-sensitive-setting")],
+            &[("SWARMCRAWL_FETCH_TIMEOUT_SECS", "invalid-sensitive-setting")],
         );
         let output = submit.exit().await;
         let jobs = ids(&output);
@@ -365,7 +365,7 @@ async fn failed_follow_snapshot_and_stats_are_nonzero_without_partial_totals_or_
 async fn namespaces_and_global_flags_work_before_or_after_every_job_command() {
     with_redis(|context| async move {
         let base = "https://example.org/docs/";
-        let env = [("CRAWL_JOB_NAMESPACE", "invalid namespace")];
+        let env = [("SWARMCRAWL_JOB_NAMESPACE", "invalid namespace")];
         let mut before = Process::with_env(
             &context,
             &["--namespace", &context.namespace, "submit", base],

@@ -612,7 +612,7 @@ async fn process_submission(mut child: OwnedChild) -> (JobId, bool) {
 #[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
 async fn independent_processes_share_submission_identity() {
     if let Ok(namespace) = std::env::var("SWARMCRAWL_TEST_SUBMISSION_NAMESPACE") {
-        let url = std::env::var("CRAWL_REDIS_URL").unwrap();
+        let url = std::env::var("SWARMCRAWL_REDIS_URL").unwrap();
         let config = RedisConfig::new(&url, 5).unwrap();
         let store = JobStore::connect_in_namespace(&config, &namespace)
             .await

@@ -25,7 +25,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "CRAWL_REDIS_URL",
+        env = "SWARMCRAWL_REDIS_URL",
         default_value = DEFAULT_REDIS_URL,
         hide_env_values = true
     )]
@@ -35,7 +35,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "CRAWL_REDIS_TIMEOUT_SECS",
+        env = "SWARMCRAWL_REDIS_TIMEOUT_SECS",
         default_value_t = DEFAULT_REDIS_TIMEOUT_SECS.to_string(),
         hide_env_values = true
     )]
@@ -45,7 +45,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "CRAWL_JOB_NAMESPACE",
+        env = "SWARMCRAWL_JOB_NAMESPACE",
         default_value = DEFAULT_JOB_NAMESPACE,
         hide_env_values = true
     )]
@@ -65,7 +65,7 @@ enum Command {
         /// Total HTTP request timeout in seconds (1-300)
         #[arg(
             long,
-            env = "CRAWL_FETCH_TIMEOUT_SECS",
+            env = "SWARMCRAWL_FETCH_TIMEOUT_SECS",
             default_value_t = DEFAULT_FETCH_TIMEOUT_SECS.to_string(),
             hide_env_values = true
         )]

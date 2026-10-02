@@ -1,13 +1,16 @@
-use std::process::{Command, Output};
+use std::{
+    net::TcpListener,
+    process::{Command, Output},
+};
 
 fn swarmcrawl(args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"));
     command
         .args(args)
-        .env_remove("CRAWL_REDIS_URL")
-        .env_remove("CRAWL_REDIS_TIMEOUT_SECS")
-        .env_remove("CRAWL_FETCH_TIMEOUT_SECS")
-        .env_remove("CRAWL_JOB_NAMESPACE");
+        .env_remove("SWARMCRAWL_REDIS_URL")
+        .env_remove("SWARMCRAWL_REDIS_TIMEOUT_SECS")
+        .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
+        .env_remove("SWARMCRAWL_JOB_NAMESPACE");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -26,9 +29,10 @@ fn help_and_version_work_without_redis() {
     assert!(help.contains("Usage: swarmcrawl [OPTIONS] <COMMAND>"));
     assert!(!help.contains("Usage: crawl"));
     assert!(help.contains("--redis-url"));
-    assert!(help.contains("CRAWL_REDIS_URL"));
-    assert!(help.contains("CRAWL_REDIS_TIMEOUT_SECS"));
-    assert!(help.contains("CRAWL_JOB_NAMESPACE"));
+    assert!(help.contains("[env: SWARMCRAWL_REDIS_URL]"));
+    assert!(help.contains("[env: SWARMCRAWL_REDIS_TIMEOUT_SECS]"));
+    assert!(help.contains("[env: SWARMCRAWL_JOB_NAMESPACE]"));
+    assert!(!help.contains("[env: CRAWL_"));
     assert!(help.contains("--namespace"));
     for name in ["check", "node", "submit", "status", "stats"] {
         assert!(help.contains(name));
@@ -37,6 +41,7 @@ fn help_and_version_work_without_redis() {
         let subcommand_help = text(&output.stdout);
         assert!(subcommand_help.contains(&format!("Usage: swarmcrawl {name}")));
         assert!(!subcommand_help.contains("Usage: crawl"));
+        assert!(!subcommand_help.contains("[env: CRAWL_"));
         assert!(subcommand_help.contains("--namespace"));
     }
     let status_help = swarmcrawl(&["status", "--help"], &[]);
@@ -45,7 +50,7 @@ fn help_and_version_work_without_redis() {
     let node_help = swarmcrawl(&["node", "--help"], &[]);
     assert!(node_help.status.success());
     assert!(text(&node_help.stdout).contains("--fetch-timeout-secs"));
-    assert!(text(&node_help.stdout).contains("CRAWL_FETCH_TIMEOUT_SECS"));
+    assert!(text(&node_help.stdout).contains("[env: SWARMCRAWL_FETCH_TIMEOUT_SECS]"));
     assert!(text(&node_help.stdout).contains("--namespace"));
 
     let version = swarmcrawl(&["--version"], &[]);
@@ -54,6 +59,42 @@ fn help_and_version_work_without_redis() {
         text(&version.stdout).trim(),
         format!("swarmcrawl {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn legacy_environment_names_are_not_configuration_aliases() {
+    let legacy = [
+        ("CRAWL_REDIS_URL", "fixture-sensitive-invalid-url"),
+        ("CRAWL_REDIS_TIMEOUT_SECS", "0"),
+        ("CRAWL_FETCH_TIMEOUT_SECS", "0"),
+        ("CRAWL_JOB_NAMESPACE", "fixture-sensitive invalid namespace"),
+    ];
+    // With no new settings, legacy Redis configuration must not override the
+    // valid defaults. Invalid IDs stop both commands before any network access.
+    for name in ["status", "stats"] {
+        let output = swarmcrawl(&[name, "invalid-id"], &legacy);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(text(&output.stderr).contains("invalid job ID"));
+        assert!(!text(&output.stderr).contains("fixture-sensitive"));
+    }
+
+    // A silent loopback peer bounds the node's connection attempt. Reaching that
+    // deadline proves legacy HTTP/namespace values did not fail validation, and
+    // the new Redis URL/deadline work without touching an external Redis service.
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("redis://{}/0", peer.local_addr().unwrap());
+    let mut env = legacy.to_vec();
+    env.extend([
+        ("SWARMCRAWL_REDIS_URL", endpoint.as_str()),
+        ("SWARMCRAWL_REDIS_TIMEOUT_SECS", "1"),
+    ]);
+    let output = swarmcrawl(&["node"], &env);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = text(&output.stderr);
+    assert!(error.contains("Redis connect timed out"), "{error}");
+    assert!(!error.contains("fixture-sensitive"));
 }
 
 #[test]
@@ -77,7 +118,10 @@ fn invalid_redis_url_fails_without_disclosing_credentials() {
 fn help_hides_redis_environment_value() {
     let output = swarmcrawl(
         &["--help"],
-        &[("CRAWL_REDIS_URL", "redis://user:test-secret@localhost/0")],
+        &[(
+            "SWARMCRAWL_REDIS_URL",
+            "redis://user:test-secret@localhost/0",
+        )],
     );
     assert!(output.status.success());
     assert!(!text(&output.stdout).contains("test-secret"));
@@ -89,7 +133,7 @@ fn help_hides_redis_environment_value() {
     ] {
         let output = swarmcrawl(
             &args,
-            &[("CRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace")],
+            &[("SWARMCRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace")],
         );
         assert!(output.status.success());
         assert!(!text(&output.stdout).contains("fixture-sensitive-namespace"));
@@ -100,12 +144,12 @@ fn help_hides_redis_environment_value() {
 fn flags_override_environment_and_environment_overrides_defaults() {
     // Invalid inputs avoid network access; different errors show which source
     // was chosen without mutating this test process's environment.
-    let output = swarmcrawl(&["check"], &[("CRAWL_REDIS_URL", "not-a-url")]);
+    let output = swarmcrawl(&["check"], &[("SWARMCRAWL_REDIS_URL", "not-a-url")]);
     assert!(text(&output.stderr).contains("invalid Redis URL"));
 
     let output = swarmcrawl(
         &["--redis-url", "not-a-url", "check"],
-        &[("CRAWL_REDIS_URL", "redis://127.0.0.1:6379/0")],
+        &[("SWARMCRAWL_REDIS_URL", "redis://127.0.0.1:6379/0")],
     );
     assert!(text(&output.stderr).contains("invalid Redis URL"));
 
@@ -116,8 +160,8 @@ fn flags_override_environment_and_environment_overrides_defaults() {
         let output = swarmcrawl(
             &args,
             &[
-                ("CRAWL_REDIS_URL", "not-a-url"),
-                ("CRAWL_REDIS_TIMEOUT_SECS", "0"),
+                ("SWARMCRAWL_REDIS_URL", "not-a-url"),
+                ("SWARMCRAWL_REDIS_TIMEOUT_SECS", "0"),
             ],
         );
         assert_eq!(output.status.code(), Some(1));
@@ -152,7 +196,7 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
 
 #[test]
 fn job_validation_precedes_network_access_and_never_echoes_inputs() {
-    let endpoint = [("CRAWL_REDIS_URL", "redis://127.0.0.1:1/0")];
+    let endpoint = [("SWARMCRAWL_REDIS_URL", "redis://127.0.0.1:1/0")];
     let output = swarmcrawl(
         &[
             "submit",
@@ -181,7 +225,7 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
         vec!["status", "-f", "1"],
         vec!["stats", "1"],
     ] {
-        let output = swarmcrawl(&args, &[("CRAWL_JOB_NAMESPACE", "invalid namespace")]);
+        let output = swarmcrawl(&args, &[("SWARMCRAWL_JOB_NAMESPACE", "invalid namespace")]);
         assert_eq!(output.status.code(), Some(1));
         assert!(text(&output.stderr).contains("invalid job namespace"));
     }
@@ -203,7 +247,7 @@ fn node_settings_are_validated_redacted_and_flags_override_environment() {
             "--namespace",
             "has space",
         ],
-        &[("CRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value")],
+        &[("SWARMCRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value")],
     );
     assert_eq!(output.status.code(), Some(1));
     assert!(text(&output.stderr).contains("invalid job namespace"));
@@ -212,8 +256,8 @@ fn node_settings_are_validated_redacted_and_flags_override_environment() {
     let output = swarmcrawl(
         &["node", "--help"],
         &[
-            ("CRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value"),
-            ("CRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace"),
+            ("SWARMCRAWL_FETCH_TIMEOUT_SECS", "fixture-sensitive-value"),
+            ("SWARMCRAWL_JOB_NAMESPACE", "fixture-sensitive-namespace"),
         ],
     );
     assert!(output.status.success());

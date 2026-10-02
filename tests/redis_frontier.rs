@@ -664,7 +664,7 @@ async fn wait_for(context: &Context, suffix: &str, count: u64) {
 }
 
 async fn process_worker(namespace: &str, job: JobId) {
-    let url = std::env::var("CRAWL_REDIS_URL").unwrap();
+    let url = std::env::var("SWARMCRAWL_REDIS_URL").unwrap();
     let config = RedisConfig::new(&url, 5).unwrap();
     let store = JobStore::connect_in_namespace(&config, namespace)
         .await

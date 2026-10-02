@@ -84,8 +84,8 @@ where
     F: FnOnce(Context) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let url = std::env::var("CRAWL_REDIS_URL")
-        .expect("set CRAWL_REDIS_URL or run scripts/redis-smoke.sh");
+    let url = std::env::var("SWARMCRAWL_REDIS_URL")
+        .expect("set SWARMCRAWL_REDIS_URL or run scripts/redis-smoke.sh");
     let config = Arc::new(RedisConfig::new(&url, 5).unwrap());
     let connection_config = AsyncConnectionConfig::new()
         .set_connection_timeout(Some(Duration::from_secs(5)))

@@ -49,9 +49,9 @@ needed for this loopback-only disposable Redis. Explicit flags override inherite
 configuration; no `.env` file is loaded.
 
 ```sh
-export CRAWL_REDIS_URL=redis://127.0.0.1:6380/0
-export CRAWL_JOB_NAMESPACE=swarmcrawl:demo:v1
-unset CRAWL_REDIS_TIMEOUT_SECS CRAWL_FETCH_TIMEOUT_SECS
+export SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6380/0
+export SWARMCRAWL_JOB_NAMESPACE=swarmcrawl:demo:v1
+unset SWARMCRAWL_REDIS_TIMEOUT_SECS SWARMCRAWL_FETCH_TIMEOUT_SECS
 ```
 
 Then, in terminal A:

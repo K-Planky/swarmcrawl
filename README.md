@@ -1,8 +1,8 @@
 # swarmcrawl
 
 A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-run
-binary, Cargo package and library are all named `swarmcrawl`. There is no `crawl`
-compatibility alias; existing `CRAWL_*` configuration names are unchanged.
+binary, Cargo package and library are all named `swarmcrawl`; environment settings
+use `SWARMCRAWL_*`. There are no legacy executable or configuration aliases.
 
 **Current capability:** `swarmcrawl node`, `submit`, `status`/`status -f`, and `stats`
 work against the shared Redis job protocol. Host-run nodes concurrently
@@ -103,10 +103,10 @@ setup:
 2. Allow TCP 6379 through that host's firewall **only from the intended node/CLI
    hosts**. Keep Redis protected mode/authentication enabled. A namespace is state
    isolation, not access control; every Redis client is trusted.
-3. Build the same revision on each node/CLI host. Supply `CRAWL_REDIS_URL` externally
-   with the Redis host's reachable address and configured authentication. Use the
-   same Redis database and `CRAWL_JOB_NAMESPACE` on every client; verify `swarmcrawl check`
-   from each machine before starting host-run nodes.
+3. Build the same revision on each node/CLI host. Supply `SWARMCRAWL_REDIS_URL`
+   externally with the Redis host's reachable address and configured authentication.
+   Use the same Redis database and `SWARMCRAWL_JOB_NAMESPACE` on every client;
+   verify `swarmcrawl check` from each machine before starting host-run nodes.
 4. Submit a target reachable from **every node**, not a node's loopback HTTP address.
    Redis hosts do not need access to the website, and nodes need no inbound crawler
    port. The supplied demo server intentionally cannot serve other hosts.
@@ -119,18 +119,20 @@ because multiple processes on one host pass.
 Global options may appear before or after any subcommand. Precedence is
 **explicit flag > environment variable > built-in default**. Values are validated
 after selection, so an overridden invalid environment value does not cause failure.
+Only `SWARMCRAWL_*` environment settings are recognized. The former `CRAWL_*`
+settings are ignored, not compatibility aliases; update shell/service exports.
 
 | Option | Environment | Default | Contract |
 | --- | --- | --- | --- |
-| `--redis-url` | `CRAWL_REDIS_URL` | `redis://127.0.0.1:6379/0` | TCP Redis URL; port 1–65535, nonnegative database, optional username/password |
-| `--redis-timeout-secs` | `CRAWL_REDIS_TIMEOUT_SECS` | `5` | Integer 1–60; one deadline for check connection+PING; job commands/nodes use it for connection setup and each operation |
-| `--namespace` | `CRAWL_JOB_NAMESPACE` | `swarmcrawl:v1` | 1–128 ASCII letters, digits, `:`, `_`, `-`; every node and job command must share it and the Redis database |
+| `--redis-url` | `SWARMCRAWL_REDIS_URL` | `redis://127.0.0.1:6379/0` | TCP Redis URL; port 1–65535, nonnegative database, optional username/password |
+| `--redis-timeout-secs` | `SWARMCRAWL_REDIS_TIMEOUT_SECS` | `5` | Integer 1–60; one deadline for check connection+PING; job commands/nodes use it for connection setup and each operation |
+| `--namespace` | `SWARMCRAWL_JOB_NAMESPACE` | `swarmcrawl:v1` | 1–128 ASCII letters, digits, `:`, `_`, `-`; every node and job command must share it and the Redis database |
 
 Examples with no credentials:
 
 ```sh
 swarmcrawl --redis-url redis://127.0.0.1:6380/0 check
-CRAWL_REDIS_URL=redis://127.0.0.1:6380/0 swarmcrawl check --redis-timeout-secs 10
+SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6380/0 swarmcrawl check --redis-timeout-secs 10
 ```
 
 Use `./target/debug/swarmcrawl` unless the binary has been installed or added to PATH.
@@ -150,7 +152,7 @@ credentials. Node runtime errors exit nonzero only after draining other owned wo
 
 | Node option | Environment | Default | Contract |
 | --- | --- | --- | --- |
-| `--fetch-timeout-secs` | `CRAWL_FETCH_TIMEOUT_SECS` | `30` | Integer 1–300; total HTTP network deadline, separate from Redis deadlines |
+| `--fetch-timeout-secs` | `SWARMCRAWL_FETCH_TIMEOUT_SECS` | `30` | Integer 1–300; total HTTP network deadline, separate from Redis deadlines |
 
 The ten-request node-wide maximum is fixed, not an option to raise. Namespaces
 are for isolated deployments/tests, not random per-process identities. Use
@@ -650,9 +652,10 @@ bash scripts/redis-smoke.sh
 Default tests require no external Redis: domain policy and checked-arithmetic
 unit tests, library configuration/redaction checks, local silent TCP peers for
 the check/job-connection deadlines, and actual CLI processes for help/version,
-validation, configuration precedence, and credential redaction. The silent peer tests
-timeout behavior only, not Redis compatibility. Fetcher tests use scripted loopback
-HTTP sockets with no external website, Redis or Docker prerequisite.
+validation, configuration precedence, ignored legacy environment names, and credential
+redaction. Silent peers test timeout behavior only, not Redis compatibility.
+Fetcher tests use scripted loopback HTTP sockets with no external website, Redis
+or Docker prerequisite.
 
 `tests/domain_policies.rs` combines the domain contracts using two HTML fixtures
 and a supplied existence/MIME table: five unique existing files (`html: 2`,
@@ -694,7 +697,7 @@ container ID for manual removal.
 For an already isolated Redis, the equivalent opt-in invocation is:
 
 ```sh
-CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
+SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process --test cli_jobs -- --ignored
 ```
 
@@ -818,7 +821,7 @@ remaining explicit responses and exact eligible paths are in the test module.
 Run only these four cases against an already isolated Redis with:
 
 ```sh
-CRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
+SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
   cargo test --locked --test cli_jobs distributed:: -- --ignored
 ```
 

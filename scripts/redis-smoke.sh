@@ -53,8 +53,8 @@ if [[ ! "$mapping" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
     printf 'Unexpected Docker loopback port mapping.\n' >&2
     exit 1
 fi
-export CRAWL_REDIS_URL="redis://${mapping}/0"
-unset CRAWL_REDIS_TIMEOUT_SECS CRAWL_FETCH_TIMEOUT_SECS CRAWL_JOB_NAMESPACE
+export SWARMCRAWL_REDIS_URL="redis://${mapping}/0"
+unset SWARMCRAWL_REDIS_TIMEOUT_SECS SWARMCRAWL_FETCH_TIMEOUT_SECS SWARMCRAWL_JOB_NAMESPACE
 
 ready=false
 for ((attempt = 0; attempt < 50; attempt++)); do

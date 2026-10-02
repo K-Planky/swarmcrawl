@@ -48,9 +48,9 @@ impl Process {
         command
             .args(args)
             // Retain only this suite's explicitly supplied Redis endpoint.
-            .env("CRAWL_REDIS_TIMEOUT_SECS", "5")
-            .env("CRAWL_JOB_NAMESPACE", &context.namespace)
-            .env_remove("CRAWL_FETCH_TIMEOUT_SECS")
+            .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
+            .env("SWARMCRAWL_JOB_NAMESPACE", &context.namespace)
+            .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

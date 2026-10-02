@@ -38,10 +38,10 @@ impl NodeProcess {
                 "--fetch-timeout-secs",
                 &timeout.to_string(),
             ])
-            .env("CRAWL_REDIS_TIMEOUT_SECS", "5")
+            .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
             // Retain only the Redis endpoint intentionally provided to this suite.
-            .env_remove("CRAWL_FETCH_TIMEOUT_SECS")
-            .env_remove("CRAWL_JOB_NAMESPACE")
+            .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
+            .env_remove("SWARMCRAWL_JOB_NAMESPACE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
