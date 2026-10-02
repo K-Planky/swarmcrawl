@@ -12,8 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
+encoding_rs = "0.8.42"
 html5ever = "0.39.0"
+mime = "0.3.17"
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip"] }
 scraper = { version = "0.27.0", default-features = false }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 url = "2.5.8"
+
+[dev-dependencies]
+flate2 = "1.1.10"

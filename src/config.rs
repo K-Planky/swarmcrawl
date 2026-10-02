@@ -4,6 +4,32 @@ use redis::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 
 pub const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379/0";
 pub const DEFAULT_REDIS_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// One total HTTP deadline, excluding time waiting for the node's request budget.
+#[derive(Debug, Clone, Copy)]
+pub struct FetchConfig {
+    pub(crate) timeout: Duration,
+}
+
+impl FetchConfig {
+    pub fn new(timeout_secs: u64) -> Result<Self, ConfigError> {
+        if !(1..=300).contains(&timeout_secs) {
+            return Err(ConfigError::InvalidFetchTimeout);
+        }
+        Ok(Self {
+            timeout: Duration::from_secs(timeout_secs),
+        })
+    }
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS),
+        }
+    }
+}
 
 /// Validated settings shared by all Redis-facing commands.
 ///
@@ -48,6 +74,7 @@ impl fmt::Debug for RedisConfig {
 pub enum ConfigError {
     InvalidRedisUrl,
     InvalidTimeout,
+    InvalidFetchTimeout,
 }
 
 impl fmt::Display for ConfigError {
@@ -58,6 +85,9 @@ impl fmt::Display for ConfigError {
                 "invalid Redis URL; use redis://host:port/database with a nonzero port and nonnegative database (TLS and Unix sockets are not supported)"
             ),
             Self::InvalidTimeout => write!(f, "Redis timeout must be between 1 and 60 seconds"),
+            Self::InvalidFetchTimeout => {
+                write!(f, "HTTP timeout must be between 1 and 300 seconds")
+            }
         }
     }
 }
@@ -112,6 +142,19 @@ mod tests {
             let error = RedisConfig::new(url, 5).unwrap_err();
             assert_eq!(error, ConfigError::InvalidRedisUrl);
             assert!(!error.to_string().contains("test-secret"));
+        }
+    }
+
+    #[test]
+    fn fetch_deadline_defaults_and_validation_are_independent_of_redis() {
+        assert_eq!(FetchConfig::default().timeout, Duration::from_secs(30));
+        assert_eq!(FetchConfig::new(1).unwrap().timeout, Duration::from_secs(1));
+        assert!(FetchConfig::new(300).is_ok());
+        for seconds in [0, 301, u64::MAX] {
+            assert_eq!(
+                FetchConfig::new(seconds).unwrap_err(),
+                ConfigError::InvalidFetchTimeout
+            );
         }
     }
 

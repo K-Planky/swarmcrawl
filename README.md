@@ -4,18 +4,19 @@ A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-
 binary is named `crawl`; the Cargo package and library remain `swarmcrawl`.
 
 **Current capability:** development foundation, tested URL/HTML/statistics
-policies, and library-level Redis submission, ownership, atomic publication and
-validated read contracts. `crawl --help`, `--version`, and `check` work. `check`
-sends a read-only Redis PING; it does not create or delete keys. HTTP fetching,
-node orchestration and the `node`, `submit`, `status`, and `stats` CLI commands
-are **not implemented yet**. Library consumers can claim and publish page outcomes,
-but no application worker fetches or consumes jobs yet.
+policies, bounded async HTTP fetching, and library-level Redis submission,
+ownership, atomic publication and validated read contracts. `crawl --help`,
+`--version`, and `check` work. `check` sends a read-only Redis PING; it does not
+create or delete keys. Node orchestration and the `node`, `submit`, `status`, and
+`stats` CLI commands are **not implemented yet**. Library consumers can fetch a
+URL or claim/publish work, but no application worker connects those components yet.
 
 ## Development setup
 
 Prerequisites:
 
-- [Rustup](https://rustup.rs/) and a normal platform C linker/build toolchain.
+- [Rustup](https://rustup.rs/) and a platform C compiler/linker/build toolchain.
+  Install CMake too for platforms where the bundled Rustls crypto build needs it.
   `rust-toolchain.toml` pins Rust **1.99.0**, minimal profile, rustfmt and Clippy.
   `Cargo.toml` requires Rust **1.99.0** or newer; the project uses edition 2024.
   Rustup installs the pinned toolchain when invoked in this repository.
@@ -102,17 +103,17 @@ category, not raw URLs, server error messages, or credentials. Success goes to s
 and errors to stderr. Exit codes: `0` success/help/version, `1` configuration or
 connectivity failure, `2` command-line syntax/usage errors.
 
-These are Redis settings, **not HTTP-fetch timeouts**. HTTP timeout/status
-policies will be defined with the fetcher. The node-wide maximum of ten requests
-is a requirement, not an option to raise. The library job store uses the same
-validated `RedisConfig`; no unused CLI namespace settings or placeholder crawl
-commands are exposed now.
+These are Redis settings, **not HTTP-fetch timeouts**. The library fetcher has a
+separate validated deadline described below; HTTP/node settings are not CLI flags
+yet. The node-wide maximum of ten requests is a requirement, not an option to
+raise. The library job store uses the same validated `RedisConfig`; no unused CLI
+namespace settings or placeholder crawl commands are exposed now.
 
 ## Crawl domain policies
 
-These contracts are implemented in the library and tested without network access;
-no worker uses them yet. HTTP outcomes/timeouts/decoding and worker scheduling
-are still future work; Redis ownership/publication is implemented below.
+These contracts are implemented in the library and tested independently of network
+access. The fetcher uses them with real local HTTP responses; application worker
+scheduling remains future work. Fetching and Redis coordination are described below.
 
 ### URL identity and scope
 
@@ -194,6 +195,77 @@ missing/redirect responses must not contribute, and non-HTML files pass zero wor
 The domain alone does not determine existence or enforce cluster ownership. Redis
 job reads validate these same invariants and parse decimal integers exactly, with
 checked range validation (see below).
+
+## Bounded HTTP fetching
+
+`fetch::Fetcher::new(FetchConfig)` builds one async reqwest client and one private
+**ten-request semaphore**. A node must construct it once and clone it for all
+jobs/tasks; clones share both client and budget. `fetch(&scope, &url)` checks scope
+before any request and returns `FetchOutcome { result: PageResult, discoveries }`.
+It does not claim, schedule, publish, retry, or remember URLs. The caller must own
+the URL first, then publish the outcome/discoveries through `JobStore::complete`.
+An operational error must instead fail the owned job; it is not an empty outcome.
+Connecting these interfaces into application nodes is the next integration step.
+
+Each call issues **one GET**, never HEAD followed by GET. Automatic redirects and
+reqwest retries are disabled. HTTP/1 is used without idle connection reuse, avoiding
+transparent stale-connection reuse retries; the async client/TLS state is shared.
+No proxy configuration, cookies, Referer forwarding, browser execution or automatic
+requests to discovered resources are enabled. HTTPS uses Rustls with platform
+certificate verification; certificate errors are operational failures, not ignored.
+
+`FetchConfig::default()` sets a **30-second total network deadline**; the library
+constructor accepts integer seconds **1–300**. It covers connection, response
+headers and HTML body transfer/decompression together, not just inactivity between
+chunks. Waiting for the shared permit is excluded. Keep the permit until the HTML
+body is fully consumed or any other response is dropped. Decode/parse only after
+network body consumption, without a parser document across an await. Errors and
+future cancellation release local network resources/permits, but **do not** make
+lost Redis ownership recoverable.
+
+### HTTP outcomes and redirects
+
+| Response | Outcome |
+| --- | --- |
+| 2xx except 206 | Existing file; HTML contributes parsed words/links, non-HTML contributes zero words |
+| 301, 302, 303, 307, 308 | No file for the redirect URL; resolve Location and return an allowed target as discovery |
+| 4xx except 408/429 | No file or discoveries; inaccessible/broken links do not contribute |
+| 206, 408, 429, 5xx, other terminal statuses | Operational error; partial/throttled/unreliable responses cannot prove a complete crawl |
+| Transport, timeout, incomplete HTML body, decompression/decoding/extraction failure | Operational error, never final partial statistics; no retry |
+
+Redirect resolution drops fragments and applies exactly the same origin/base-prefix
+boundary before any target retrieval. Invalid, unsupported, credentialed and
+out-of-scope targets are not admitted. Missing/non-ASCII Location headers are
+explicit errors. Redirect bodies are not parsed. Chains, loops, self redirects and
+converging targets return discoveries only; **Redis ownership/deduplication**, not
+recursive client fetching, decides whether another GET may occur. Redirect URLs do
+not count as files; successful eligible targets do, using their own extensions.
+
+### Body and encoding policy
+
+- Classify only by Content-Type using the domain MIME rules. A missing/empty or
+  non-HTML type is a non-HTML file, with no sniffing based on suffix/body. Reject
+  ambiguous multiple or non-ASCII Content-Type headers; malformed HTML MIME
+  parameters cannot silently choose an encoding.
+- Fully consume HTML; there is no truncation/size cap presented as a complete
+  crawl. Large HTML documents require corresponding memory for bytes, decoded
+  text and the parser. The network deadline does not bound synchronous CPU parsing.
+- Drop non-HTML responses immediately after successful headers; do not wait for or
+  deliberately consume the full body. Successful headers establish existence even
+  when the remaining body is not verified. Some bytes can already be buffered or
+  arrive before socket cancellation: this is **not** a zero-byte download promise.
+- Advertise/support gzip; reqwest decompresses it during bounded body reads.
+  Identity HTML is supported; remaining unsupported Content-Encoding values fail
+  rather than treating compressed bytes as text. Corrupt gzip is a transfer error.
+  Non-HTML encodings do not need decoding because those bodies are not consumed.
+- Validate declared MIME charset labels using `encoding_rs` (including common
+  legacy labels); default to UTF-8. A UTF-8/UTF-16 BOM can override a recognized
+  declared charset. Do not sniff `<meta charset>` or apply locale heuristics.
+  Unknown labels or malformed decoded text fail, rather than replacement-character
+  parsing that might miss hyperlinks. HTML entities remain the parser's job.
+- `FetchError` keeps safe categories/status codes only, with no raw reqwest source,
+  URL, Location, header value, credentials or query in Display/Debug. Node error
+  reporting must add safe job/node context when orchestration is implemented.
 
 ## Redis job storage and read contracts
 
@@ -284,8 +356,9 @@ An empty frontier with owned work remains running.
 
 ## Atomic frontier protocol
 
-The worker protocol extends the schema above; HTTP fetching and node orchestration
-are separate future steps. Its correctness rests on these invariants:
+The worker protocol extends the schema above; bounded HTTP fetching is a separate
+component, and application node orchestration remains future work. Its correctness
+rests on these invariants:
 
 1. Within a job, each canonical URL is in `seen` exactly once. Every seen URL is
    either waiting, owned by exactly one worker, or processed:
@@ -355,8 +428,9 @@ terminal state are in the same script, serialized with transactional readers.
 Therefore each URL has one ownership interval and at most one contribution,
 completion cannot precede delayed discoveries, and final totals do not depend on
 worker interleaving. There is no re-fetch/recovery path. Failure is explicitly not
-a completed crawl. This is a Redis protocol proof/test boundary, not yet evidence
-of actual HTTP fetching or an end-to-end distributed crawler.
+a completed crawl. This is a Redis protocol proof/test boundary, not evidence of
+an end-to-end distributed crawler. HTTP fetching is separately tested below;
+application-node integration still needs process-level verification.
 
 ## Quality gates and tests
 
@@ -373,8 +447,9 @@ bash scripts/redis-smoke.sh
 Default tests require no external Redis: domain policy and checked-arithmetic
 unit tests, library configuration/redaction checks, local silent TCP peers for
 the check/job-connection deadlines, and actual CLI processes for help/version,
-validation, configuration precedence, and credential redaction. The silent peer tests timeout
-behavior only, not Redis compatibility.
+validation, configuration precedence, and credential redaction. The silent peer tests
+timeout behavior only, not Redis compatibility. Fetcher tests use scripted loopback
+HTTP sockets with no external website, Redis or Docker prerequisite.
 
 `tests/domain_policies.rs` combines the domain contracts using two HTML fixtures
 and a supplied existence/MIME table: five unique existing files (`html: 2`,
@@ -382,6 +457,26 @@ and a supplied existence/MIME table: five unique existing files (`html: 2`,
 duplicates, outside links, a broken link, MIME/suffix disagreement and an
 extensionless non-HTML file. This is static domain verification, **not** evidence
 of HTTP fetching, Redis deduplication or a working distributed crawler.
+
+`tests/http_fetch.rs` has ten real local-HTTP component tests, using the reusable
+`tests/support/http.rs` fixture (ephemeral loopback ports, request logs, response
+gates, in-flight peak measurement, and RAII socket/task cleanup on success/failure).
+Cases are bounded to 15 seconds and fixture polling to five. They cover MIME/suffix
+disagreement and missing MIME; full-page late links and 10,004 hand-checked words;
+HTTP absence versus operational statuses; all five redirect statuses, chains,
+loops, shared targets, query/fragment identity, outside/credentialed targets and
+no hidden GETs; three-file/eight-word traversal totals using a test-only deduplicating
+queue; strict charset/BOM/gzip handling and invalid headers; ten advertised 100 MiB
+non-HTML bodies canceled while their tails remain gated; **31 gated HTML requests
+across two scopes/clones with peak exactly ten**, with only one new GET admitted
+when one body completes; header/body deadlines, truncated transfers/disconnects
+without retries; unreachable peers; and resource cleanup after canceled futures.
+These establish fetcher behavior, not Redis scheduling or cross-process HTTP
+at-most-once guarantees. Run them separately with:
+
+```sh
+cargo test --locked --test http_fetch
+```
 
 The real-Redis integration tests are **opt-in** and ignored by `cargo test`.
 `scripts/redis-smoke.sh` starts a fresh Redis 7.4 Alpine container on an automatically
@@ -425,7 +520,8 @@ and four gated independent processes claiming/publishing a convergent graph with
 25 unique child ownerships and hand-checked totals (26 files, one extension,
 77 words). Process cleanup and case deadlines match the storage suite.
 These use **mock page outcomes**, not an HTTP server or application node binary;
-HTTP at-most-once retrieval/concurrency and full CLI evidence remain future work.
+cluster-wide HTTP at-most-once retrieval, application-node concurrency and full CLI
+evidence remain future integration work. The local fetcher suite is separate.
 A default test pass is **not** evidence of Docker/Redis or distributed crawl
 verification. CI runs the same gates for new commits.
 
@@ -440,7 +536,9 @@ shellcheck scripts/redis-smoke.sh
 
 - `src/main.rs`: Clap presentation, configuration-source selection, exit behavior;
   no Redis schema or network policy lives in CLI parsing.
-- `src/config.rs`: validated shared Redis settings and typed, secret-safe errors.
+- `src/config.rs`: validated Redis/HTTP deadlines and typed, secret-safe errors.
+- `src/fetch.rs`: shared async client/request budget, scope-safe GET classification,
+  explicit redirect discoveries, complete HTML decoding and operational errors.
 - `src/redis.rs`: async multiplexed Redis connectivity and bounded read-only check.
 - `src/jobs.rs`, `src/jobs/submit.lua`: typed job IDs/states, bounded async Redis
   storage, atomic submission/seed initialization and transactional validated reads.
@@ -454,15 +552,18 @@ shellcheck scripts/redis-smoke.sh
   CLI/Redis integration checks; `.github/workflows/checks.yml` runs the local gates
   on Ubuntu.
 
-Use Rust naming conventions and direct domain-specific modules/functions. Add HTTP
-fetching and node orchestration modules only when they implement real contracts.
+Use Rust naming conventions and direct domain-specific modules/functions. Add node
+orchestration modules only when they implement real contracts.
 Libraries expose typed `Result` errors; the CLI reports them once at the boundary.
 There is no logging framework yet; worker diagnostics must later add safe job/node/operation context without exposing
 URL credentials, sensitive query values, or Redis credentials. Add dependencies
 only for implemented needs: Clap for command parsing, Tokio for async work/deadlines,
 Redis's Tokio support for the check/job store, `url` for identity/scope and `scraper`
 for HTML extraction. Direct `html5ever` access configures scraper's parser with
-scripting disabled; it adds no second parser. HTTP dependencies wait for fetching.
+scripting disabled; it adds no second parser. Reqwest has only Rustls/gzip features
+(no blocking client, cookies, HTTP/2, system proxies, or unused format helpers).
+`mime` validates HTML charset parameters and `encoding_rs` supplies strict text
+decoding; dev-only `flate2` generates deterministic compressed HTTP fixtures.
 Redis default features remain off; submission uses direct `EVAL`, not the optional
 script-cache helper, so no extra script/hash dependency is needed.
 

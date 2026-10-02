@@ -1,7 +1,8 @@
-//! Testable crawl policies, shared configuration, and Redis job storage/read contracts.
-//! Worker ownership, completion publication and HTTP fetching are not implemented yet.
+//! Testable crawl policies, bounded HTTP fetching, and atomic Redis job coordination.
+//! Application node orchestration and the crawl CLI remain separate integration work.
 
 pub mod config;
+pub mod fetch;
 pub mod html;
 pub mod jobs;
 pub mod redis;
