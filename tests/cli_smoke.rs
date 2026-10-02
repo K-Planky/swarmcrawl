@@ -27,12 +27,11 @@ fn help_and_version_work_without_redis() {
     assert!(help.status.success());
     let help = text(&help.stdout);
     assert!(help.contains("Usage: swarmcrawl [OPTIONS] <COMMAND>"));
-    assert!(!help.contains("Usage: crawl"));
     assert!(help.contains("--redis-url"));
     assert!(help.contains("[env: SWARMCRAWL_REDIS_URL]"));
     assert!(help.contains("[env: SWARMCRAWL_REDIS_TIMEOUT_SECS]"));
     assert!(help.contains("[env: SWARMCRAWL_JOB_NAMESPACE]"));
-    assert!(!help.contains("[env: CRAWL_"));
+    assert_eq!(help.matches("[env: ").count(), 3);
     assert!(help.contains("--namespace"));
     for name in ["check", "node", "submit", "status", "stats"] {
         assert!(help.contains(name));
@@ -40,9 +39,18 @@ fn help_and_version_work_without_redis() {
         assert!(output.status.success());
         let subcommand_help = text(&output.stdout);
         assert!(subcommand_help.contains(&format!("Usage: swarmcrawl {name}")));
-        assert!(!subcommand_help.contains("Usage: crawl"));
-        assert!(!subcommand_help.contains("[env: CRAWL_"));
         assert!(subcommand_help.contains("--namespace"));
+        for setting in [
+            "SWARMCRAWL_REDIS_URL",
+            "SWARMCRAWL_REDIS_TIMEOUT_SECS",
+            "SWARMCRAWL_JOB_NAMESPACE",
+        ] {
+            assert!(subcommand_help.contains(&format!("[env: {setting}]")));
+        }
+        assert_eq!(
+            subcommand_help.matches("[env: ").count(),
+            if name == "node" { 4 } else { 3 }
+        );
     }
     let status_help = swarmcrawl(&["status", "--help"], &[]);
     assert!(text(&status_help.stdout).contains("--follow"));
@@ -62,39 +70,25 @@ fn help_and_version_work_without_redis() {
 }
 
 #[test]
-fn legacy_environment_names_are_not_configuration_aliases() {
-    let legacy = [
-        ("CRAWL_REDIS_URL", "fixture-sensitive-invalid-url"),
-        ("CRAWL_REDIS_TIMEOUT_SECS", "0"),
-        ("CRAWL_FETCH_TIMEOUT_SECS", "0"),
-        ("CRAWL_JOB_NAMESPACE", "fixture-sensitive invalid namespace"),
-    ];
-    // With no new settings, legacy Redis configuration must not override the
-    // valid defaults. Invalid IDs stop both commands before any network access.
-    for name in ["status", "stats"] {
-        let output = swarmcrawl(&[name, "invalid-id"], &legacy);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        assert!(text(&output.stderr).contains("invalid job ID"));
-        assert!(!text(&output.stderr).contains("fixture-sensitive"));
-    }
-
-    // A silent loopback peer bounds the node's connection attempt. Reaching that
-    // deadline proves legacy HTTP/namespace values did not fail validation, and
-    // the new Redis URL/deadline work without touching an external Redis service.
+fn environment_settings_bound_node_connection_attempts() {
+    // A silent loopback peer exercises the configured connection deadline without
+    // depending on an external Redis service or allowing any HTTP retrieval.
     let peer = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("redis://{}/0", peer.local_addr().unwrap());
-    let mut env = legacy.to_vec();
-    env.extend([
-        ("SWARMCRAWL_REDIS_URL", endpoint.as_str()),
-        ("SWARMCRAWL_REDIS_TIMEOUT_SECS", "1"),
-    ]);
-    let output = swarmcrawl(&["node"], &env);
+    let output = swarmcrawl(
+        &["node"],
+        &[
+            ("SWARMCRAWL_REDIS_URL", endpoint.as_str()),
+            ("SWARMCRAWL_REDIS_TIMEOUT_SECS", "1"),
+            ("SWARMCRAWL_FETCH_TIMEOUT_SECS", "2"),
+            ("SWARMCRAWL_JOB_NAMESPACE", "swarmcrawl:cli-smoke:v1"),
+        ],
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let error = text(&output.stderr);
     assert!(error.contains("Redis connect timed out"), "{error}");
-    assert!(!error.contains("fixture-sensitive"));
+    assert!(!error.contains(&endpoint));
 }
 
 #[test]

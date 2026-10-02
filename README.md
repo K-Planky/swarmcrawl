@@ -2,7 +2,7 @@
 
 A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-run
 binary, Cargo package and library are all named `swarmcrawl`; environment settings
-use `SWARMCRAWL_*`. There are no legacy executable or configuration aliases.
+use `SWARMCRAWL_*`.
 
 **Current capability:** `swarmcrawl node`, `submit`, `status`/`status -f`, and `stats`
 work against the shared Redis job protocol. Host-run nodes concurrently
@@ -119,8 +119,7 @@ because multiple processes on one host pass.
 Global options may appear before or after any subcommand. Precedence is
 **explicit flag > environment variable > built-in default**. Values are validated
 after selection, so an overridden invalid environment value does not cause failure.
-Only `SWARMCRAWL_*` environment settings are recognized. The former `CRAWL_*`
-settings are ignored, not compatibility aliases; update shell/service exports.
+Environment settings use the `SWARMCRAWL_*` names listed below.
 
 | Option | Environment | Default | Contract |
 | --- | --- | --- | --- |
@@ -652,8 +651,8 @@ bash scripts/redis-smoke.sh
 Default tests require no external Redis: domain policy and checked-arithmetic
 unit tests, library configuration/redaction checks, local silent TCP peers for
 the check/job-connection deadlines, and actual CLI processes for help/version,
-validation, configuration precedence, ignored legacy environment names, and credential
-redaction. Silent peers test timeout behavior only, not Redis compatibility.
+validation, configuration precedence, and credential redaction.
+Silent peers test timeout behavior only, not Redis compatibility.
 Fetcher tests use scripted loopback HTTP sockets with no external website, Redis
 or Docker prerequisite.
 
