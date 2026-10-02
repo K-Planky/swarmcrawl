@@ -1,0 +1,27 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-and-redis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository toolchain
+        run: rustup show
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Unit and CLI tests
+        run: cargo test --locked
+      - name: Locked build
+        run: cargo build --locked
+      - name: Real Docker Redis smoke check
+        run: bash scripts/redis-smoke.sh

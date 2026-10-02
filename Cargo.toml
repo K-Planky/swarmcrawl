@@ -1,0 +1,16 @@
+[package]
+name = "swarmcrawl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A Redis-coordinated distributed crawler"
+publish = false
+
+[[bin]]
+name = "crawl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
