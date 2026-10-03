@@ -9,6 +9,8 @@ if not owner then
 end
 if owner ~= worker then return {'ownership'} end
 if redis.call('SISMEMBER', seen, parent) ~= 1 then return {'invalid'} end
+-- Abort freezes diagnostics; late outcomes drain without failing the node.
+if data.state == 'aborted' then return {'aborted'} end
 if data.state == 'failed' then return {'failed', data.failure} end
 if data.state ~= 'running' then return {'invalid'} end
 if outcome == 'fetch' or outcome == 'statistics' or outcome == 'protocol' then

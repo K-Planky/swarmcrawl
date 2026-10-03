@@ -11,6 +11,11 @@ const CLAIM_SCRIPT: &str = concat!(
     "\n",
     include_str!("claim.lua")
 );
+const ABORT_SCRIPT: &str = concat!(
+    include_str!("protocol.lua"),
+    "\n",
+    include_str!("abort.lua")
+);
 const COMPLETE_SCRIPT: &str = concat!(
     include_str!("protocol.lua"),
     "\n",
@@ -83,12 +88,31 @@ pub enum Completion {
         done: bool,
     },
     AlreadyCompleted,
+    /// Deliberate user abort: discard this outcome without shutting down the node.
+    Aborted,
     /// A terminal failure freezes partial results and outstanding work. It is
     /// never successful completion, even when a network task drained normally.
     Failed(JobFailure),
 }
 
 impl JobStore {
+    /// Atomically abort a running job. Returns false for any retained terminal
+    /// state; unknown/corrupt jobs fail without writes. Never retries ambiguous writes.
+    pub async fn abort(&self, job: JobId) -> Result<bool, StoreError> {
+        let reply: Vec<String> = bounded(
+            self.timeout,
+            "abort job",
+            self.worker_command(ABORT_SCRIPT, job)
+                .query_async(&mut self.connection.clone()),
+        )
+        .await?;
+        match reply.as_slice() {
+            [kind] if kind == "aborted" => Ok(true),
+            [kind] if kind == "unchanged" => Ok(false),
+            _ => Err(protocol_error(&reply)),
+        }
+    }
+
     /// Allocate a fresh process identity across hosts using the shared namespace.
     /// Retain the sequence with the job state; never retry an ambiguous write.
     pub async fn allocate_worker(&self) -> Result<WorkerId, StoreError> {
@@ -261,6 +285,7 @@ impl JobStore {
                 })
             }
             [kind] if kind == "already" => Ok(Completion::AlreadyCompleted),
+            [kind] if kind == "aborted" => Ok(Completion::Aborted),
             [kind, failure] if kind == "failed" => {
                 let reason = match failure.as_str() {
                     "fetch" => JobFailure::Fetch,

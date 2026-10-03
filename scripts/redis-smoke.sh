@@ -54,6 +54,7 @@ if [[ ! "$mapping" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
     exit 1
 fi
 export SWARMCRAWL_REDIS_URL="redis://${mapping}/0"
+export SWARMCRAWL_CONFIG_DIR="$work_dir/client-config"
 unset SWARMCRAWL_REDIS_TIMEOUT_SECS SWARMCRAWL_FETCH_TIMEOUT_SECS SWARMCRAWL_JOB_NAMESPACE
 
 ready=false

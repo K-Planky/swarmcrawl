@@ -4,9 +4,11 @@ use std::{
 };
 
 fn swarmcrawl(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let config_dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"));
     command
         .args(args)
+        .env("SWARMCRAWL_CONFIG_DIR", config_dir.path().join("absent"))
         .env_remove("SWARMCRAWL_REDIS_URL")
         .env_remove("SWARMCRAWL_REDIS_TIMEOUT_SECS")
         .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
@@ -33,7 +35,9 @@ fn help_and_version_work_without_redis() {
     assert!(help.contains("[env: SWARMCRAWL_JOB_NAMESPACE]"));
     assert_eq!(help.matches("[env: ").count(), 3);
     assert!(help.contains("--namespace"));
-    for name in ["check", "node", "submit", "status", "stats"] {
+    for name in [
+        "check", "node", "submit", "status", "stats", "jobs", "abort",
+    ] {
         assert!(help.contains(name));
         let output = swarmcrawl(&[name, "--help"], &[]);
         assert!(output.status.success());
@@ -180,6 +184,8 @@ fn invalid_timeout_is_a_config_error_and_missing_command_is_a_usage_error() {
         vec!["status"],
         vec!["status", "-f"],
         vec!["stats"],
+        vec!["abort"],
+        vec!["abort", "1", "--all"],
     ] {
         let output = swarmcrawl(&args, &[]);
         assert_eq!(output.status.code(), Some(2));
@@ -205,7 +211,7 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
     assert!(error.contains("submit input 2"));
     assert!(error.contains("no URLs submitted"));
     assert!(!error.contains("fixture-"));
-    for command in ["status", "stats"] {
+    for command in ["status", "stats", "abort"] {
         let output = swarmcrawl(&[command, "fixture-sensitive-id"], &endpoint);
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
@@ -218,6 +224,9 @@ fn job_validation_precedes_network_access_and_never_echoes_inputs() {
         vec!["status", "1"],
         vec!["status", "-f", "1"],
         vec!["stats", "1"],
+        vec!["abort", "1"],
+        vec!["abort", "--all"],
+        vec!["jobs"],
     ] {
         let output = swarmcrawl(&args, &[("SWARMCRAWL_JOB_NAMESPACE", "invalid namespace")]);
         assert_eq!(output.status.code(), Some(1));

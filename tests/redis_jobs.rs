@@ -21,6 +21,46 @@ use tokio::task::JoinSet;
 
 #[tokio::test]
 #[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
+async fn retained_job_listing_is_exact_sorted_and_rejects_corrupt_ids() {
+    with_redis(|context| async move {
+        let store = context.store().await;
+        assert!(store.jobs().await.unwrap().is_empty());
+        let mut expected = Vec::new();
+        for number in [2u64, 10, 9_007_199_254_740_993, i64::MAX as u64] {
+            context
+                .query::<()>(
+                    redis::cmd("SET")
+                        .arg(context.key("next-job-id"))
+                        .arg((number - 1).to_string()),
+                )
+                .await;
+            let base = CrawlUrl::parse(&format!("https://example.org/list/{number}")).unwrap();
+            let job = store.submit(&base).await.unwrap().job;
+            assert_eq!(job.to_string(), number.to_string());
+            expected.push(job);
+        }
+        assert_eq!(store.jobs().await.unwrap(), expected);
+        // HVALS sees old retained submissions directly, not only currently active IDs.
+        for job in &expected {
+            assert!(store.abort(*job).await.unwrap());
+        }
+        assert!(store.active_jobs().await.unwrap().is_empty());
+        assert_eq!(store.jobs().await.unwrap(), expected);
+        for value in ["fixture-secret", "0", "01", "9223372036854775808", "2"] {
+            context
+                .hash_set(&context.key("submissions"), "fixture-key", value)
+                .await;
+            let error = store.jobs().await.unwrap_err();
+            assert!(matches!(error, StoreError::InvalidData(_)));
+            assert!(!format!("{error:?}").contains("fixture-secret"));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
 async fn concurrent_canonical_submission_initializes_one_retained_seed() {
     with_redis(|context| async move {
         // Separate connections model independent clients, not a local mutex.

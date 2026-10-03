@@ -37,6 +37,192 @@ fn ids(output: &Output) -> Vec<JobId> {
         .collect()
 }
 
+#[tokio::test]
+#[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
+async fn jobs_lists_retained_states_and_abort_all_is_namespace_scoped_and_reports_partial_failure()
+{
+    with_redis(|context| async move {
+        let empty = run(&context, &["jobs"]).await;
+        success(&empty);
+        assert!(empty.stdout.contains("No jobs"));
+        success(&run(&context, &["abort", "--all"]).await);
+        let submitted = run(
+            &context,
+            &[
+                "submit",
+                "https://example.org/running/?secret=fixture-query",
+                "https://example.org/done/",
+                "https://example.org/failed/",
+                "https://example.org/abort/",
+            ],
+        )
+        .await;
+        let jobs = ids(&submitted);
+        let store = context.store().await;
+        let worker = store.allocate_worker().await.unwrap();
+        let claim = store.claim(jobs[1], &worker).await.unwrap().unwrap();
+        store
+            .complete(&claim, PageResult::File { html_word_count: 2 }, &[])
+            .await
+            .unwrap();
+        let claim = store.claim(jobs[2], &worker).await.unwrap().unwrap();
+        store.fail(&claim, JobFailure::Fetch).await.unwrap();
+        success(&run(&context, &["abort", &jobs[3].to_string()]).await);
+        let listed = run(&context, &["jobs"]).await;
+        success(&listed);
+        let rows: Vec<_> = listed.stdout.lines().collect();
+        assert_eq!(rows.len(), 4);
+        for (index, state) in ["running", "done", "failed (fetch)", "aborted"]
+            .iter()
+            .enumerate()
+        {
+            assert!(rows[index].starts_with(&format!("job {} ", jobs[index])));
+            assert!(rows[index].ends_with(state));
+        }
+        assert!(!listed.stdout.contains("fixture-query"));
+        let stats = run(&context, &["stats", &jobs[1].to_string()]).await;
+        success(&stats);
+        // Another isolated namespace remains completely untouched by --all.
+        let other = Context {
+            namespace: format!("{}:other", context.namespace),
+            ..context.clone()
+        };
+        let other_job = ids(&run(&other, &["submit", "https://example.org/other/"]).await)[0];
+        let all = run(&context, &["abort", "--all"]).await;
+        success(&all);
+        assert_eq!(all.stdout, format!("job {}  aborted\n", jobs[0]));
+        assert_eq!(
+            other.store().await.snapshot(other_job).await.unwrap().state,
+            JobState::Running
+        );
+        assert_eq!(
+            run(&context, &["stats", &jobs[1].to_string()]).await.stdout,
+            stats.stdout
+        );
+        for job in &jobs {
+            let output = run(&context, &["abort", &job.to_string()]).await;
+            success(&output);
+            assert!(output.stdout.contains("unchanged"));
+        }
+        let unknown = run(&context, &["abort", "999"]).await;
+        assert_eq!(unknown.code, Some(1));
+        assert!(unknown.stderr.contains("unknown job"));
+        // Bulk operation is intentionally sequential: a corrupt later job must
+        // report failure, not undo or hide the earlier successful abort.
+        let more = ids(&run(
+            &context,
+            &[
+                "submit",
+                "https://example.org/new/",
+                "https://example.org/corrupt/",
+            ],
+        )
+        .await);
+        context
+            .hash_set(
+                &context.job_key(more[1], "meta"),
+                "processed",
+                "fixture-secret",
+            )
+            .await;
+        let output = run(&context, &["abort", "--all"]).await;
+        assert_eq!(output.code, Some(1));
+        assert_eq!(output.stdout, format!("job {}  aborted\n", more[0]));
+        assert!(output.stderr.contains("earlier aborts remain in effect"));
+        assert!(!output.stderr.contains("fixture-secret"));
+        assert_eq!(
+            store.snapshot(more[0]).await.unwrap().state,
+            JobState::Aborted
+        );
+        let listed = run(&context, &["jobs"]).await;
+        assert_eq!(listed.code, Some(1));
+        assert!(!listed.stderr.contains("fixture-secret"));
+        assert!(listed.stdout.contains("aborted"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Unix processes and real Redis; run scripts/redis-smoke.sh"]
+async fn abort_drains_two_nodes_discards_late_links_and_errors_and_keeps_nodes_available() {
+    with_redis(|context| async move {
+        let gate = Arc::new(Semaphore::new(0));
+        let mut replies = vec![(
+            "/abort/".into(),
+            Reply::new(
+                200,
+                "text/html",
+                (0..22)
+                    .map(|i| format!("<a href=p{i}></a>"))
+                    .collect::<String>(),
+            ),
+        )];
+        for index in 0..22 {
+            let reply = if index % 2 == 0 {
+                Reply::new(200, "text/html", "partial words").gated_body("<a href=late></a>", &gate)
+            } else {
+                Reply::new(503, "text/plain", "late failure").gated_headers(&gate)
+            };
+            replies.push((format!("/abort/p{index}"), reply));
+        }
+        replies.push(("/healthy/".into(), Reply::new(200, "text/html", "one two")));
+        let fixture = HttpFixture::start(replies).await;
+        let base = fixture.url("/abort/");
+        let job = ids(&run(&context, &["submit", base.as_str()]).await)[0];
+        let id = job.to_string();
+        let mut first = start_node(&context).await;
+        fixture.wait_for_requests(11).await; // First node holds all ten slots.
+        let mut second = start_node(&context).await;
+        fixture.wait_for_requests(21).await; // Second node holds ten more.
+        let store = context.store().await;
+        let mut follow = Process::start(&context, &["status", "-f", &id]);
+        follow.wait_stdout("frontier 2  in flight 20").await;
+        success(&run(&context, &["abort", &id]).await);
+        let frozen = store.snapshot(job).await.unwrap();
+        assert_eq!(frozen.state, JobState::Aborted);
+        assert_eq!(
+            (frozen.processed, frozen.frontier, frozen.in_flight),
+            (1, 2, 20)
+        );
+        let output = follow.exit().await;
+        assert_eq!(output.code, Some(1));
+        assert!(output.stdout.ends_with("aborted\n"));
+        assert!(output.stderr.contains("aborted"));
+        let output = run(&context, &["stats", &id]).await;
+        assert_eq!(output.code, Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(first.running() && second.running());
+        let healthy = ids(&run(&context, &["submit", fixture.url("/healthy/").as_str()]).await)[0];
+        gate.add_permits(20);
+        success(&run(&context, &["status", "-f", &healthy.to_string()]).await);
+        assert!(first.running() && second.running());
+        // Graceful drains prove every late outcome (including 503s) was processed
+        // without a node failure or publication after the abort.
+        stop_node(&mut first).await;
+        stop_node(&mut second).await;
+        assert_eq!(store.snapshot(job).await.unwrap(), frozen);
+        assert_eq!(store.stats(healthy).await.unwrap().total_word_count, 2);
+        assert_eq!(ids(&run(&context, &["submit", base.as_str()]).await), [job]);
+        assert_eq!(fixture.requests().len(), 22); // seed + 20 owners + healthy
+        assert!(
+            !fixture
+                .requests()
+                .iter()
+                .any(|request| request.target.ends_with("late")
+                    || request.target.ends_with("p20")
+                    || request.target.ends_with("p21"))
+        );
+        let listed = run(&context, &["jobs"]).await;
+        success(&listed);
+        assert!(listed.stdout.contains("aborted\n"));
+        assert!(listed.stdout.ends_with("done\n"));
+        fixture.assert_healthy();
+    })
+    .await
+    .unwrap();
+}
+
 async fn start_node(context: &Context) -> Process {
     let mut node = Process::start(context, &["node", "--fetch-timeout-secs", "5"]);
     node.wait_stderr("ready; polling").await;

@@ -56,7 +56,7 @@ local function load_job()
        not base or base == '' or not unsigned(processed, u64_max) then
         return nil, 'invalid'
     end
-    if not ((state == 'running' or state == 'done') and failure == '' or
+    if not ((state == 'running' or state == 'done' or state == 'aborted') and failure == '' or
             state == 'failed' and (failure == 'fetch' or failure == 'statistics' or
                                   failure == 'protocol')) then
         return nil, 'invalid'

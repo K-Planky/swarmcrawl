@@ -4,10 +4,14 @@ A Rust/Tokio distributed crawler coordinated through one Docker Redis. The host-
 binary, Cargo package and library are all named `swarmcrawl`; environment settings
 use `SWARMCRAWL_*`.
 
-**Current capability:** `swarmcrawl node`, `submit`, `status`/`status -f`, and `stats`
-work against the shared Redis job protocol. Host-run nodes concurrently
-claim/fetch/publish work, stay available for later submissions, and drain owned
-work on graceful shutdown. User commands talk only to Redis; finished statistics
+**Current capability:** `swarmcrawl cluster init <IP>` / `join <HOST>` save a private connection
+so `node`, `submit`, `status`/`status -f`, and `stats` work across terminals without
+repeating settings. `jobs` lists retained running/completed/failed/aborted jobs;
+`abort <job>` or `abort --all` permanently stops selected running work.
+`cluster start` / `stop` manage only CLI-owned disposable Redis.
+The crawler commands work against the shared Redis job protocol. Host-run nodes
+concurrently claim/fetch/publish work, stay available for later submissions, and
+drain owned work on graceful shutdown. Job commands talk only to Redis; finished statistics
 are immediately readable by a new CLI process and retained after nodes exit.
 `swarmcrawl --help`, `--version`, and the read-only Redis `check` also work. Domain,
 HTTP, Redis and CLI/node process tests pass, including adversarial traversal with
@@ -19,7 +23,9 @@ owner-controlled demo/release actions remain separate.
 
 ## Start here
 
-1. Follow [development setup](#development-setup) and [start Redis](#start-a-development-redis).
+1. Build/install with [development setup](#development-setup), then follow the
+   **[CLI-managed two-PC setup](#cli-managed-two-pc-setup)**. For a single PC,
+   explicitly use `cluster init 127.0.0.1` and skip `cluster join`.
 2. For a repeatable presentation, use **[demo/README.md](demo/README.md)**. It starts
    a supplied gated local site and three host nodes; no public Internet is needed.
 3. For your own target, launch [N nodes](#running-nodes-and-lifecycle), then
@@ -39,10 +45,16 @@ Prerequisites:
   `rust-toolchain.toml` pins Rust **1.99.0**, minimal profile, rustfmt and Clippy.
   `Cargo.toml` requires Rust **1.99.0** or newer; the project uses edition 2024.
   Rustup installs the pinned toolchain when invoked in this repository.
-- Docker with a reachable running daemon. Only Redis runs in Docker, not the Rust
-  binary. On Windows/WSL, start Docker Desktop and enable integration for the distro;
-  a Windows `docker.exe` on PATH alone does not establish a usable Linux daemon.
-- Bash and GNU `timeout` (coreutils) for the isolated Redis smoke script.
+- **On the Redis-hosting PC only:** Docker with a reachable local Linux-container
+  daemon and access to `redis:7.4-alpine` (the first initialization may download it).
+  Joining PCs do **not** need Docker. Only Redis runs in Docker, not the Rust binary.
+  CLI-managed private storage currently requires Unix permissions (Linux/WSL/macOS);
+  native Windows users should run it in WSL. On WSL, start Docker Desktop and enable
+  distro integration; a Windows `docker.exe` on PATH alone is not enough. Nothing
+  installs Docker/system packages or changes firewalls automatically.
+- GNU `timeout` (coreutils) on PATH for setup CLI tests; Bash too for the isolated
+  Redis smoke script. Python 3 is needed for the opt-in interactive terminal tests
+  (and the demo fixture), not for the application.
   ShellCheck is optional for shell linting.
 
 From the repository root:
@@ -57,7 +69,272 @@ cargo run --locked -- --version
 The application lockfile is committed. Dependency updates are intentional changes;
 normal builds/tests use `--locked`. No `.env` file is loaded automatically.
 
+## CLI-managed two-PC setup
+
+Build the same revision on both PCs. To make the examples available as `swarmcrawl`
+from any terminal, install once on each PC:
+
+```sh
+cargo install --locked --path .
+# Ensure ~/.cargo/bin is on PATH, or use ./target/debug/swarmcrawl after cargo build.
+```
+
+### 1. Redis-hosting PC
+
+```sh
+swarmcrawl cluster init 192.168.1.50
+# Enter your chosen Redis password at the hidden prompt, then confirm it.
+swarmcrawl node
+```
+
+Replace the example with the **trusted LAN/private VPN IP belonging to this PC and
+reachable from the second PC**. An IP is always required, even interactively: there
+is no address menu, implicit loopback selection, or `--bind` option. For one-PC use,
+explicitly enter `127.0.0.1`; wildcard/multicast addresses are rejected. Virtual/WSL
+addresses may not be reachable from another physical PC.
+
+Choose a strong, unique password and keep it in a password manager. Init does not
+generate or display a password. The interactive password confirmation catches typos
+before saving anything or creating a container. For automation, pass one password
+line from a protected file or secret manager, never a command-line password:
+
+```sh
+swarmcrawl cluster init 192.168.1.50 --password-stdin < /private/path/redis-password
+# Optional initial settings, shared by every client:
+# swarmcrawl cluster init 192.168.1.50 --port 6380 --database 3 --namespace mycrawl:v1
+```
+
+These are **alternative first-time commands**, not commands to run after an existing
+initialization. Passwords must be 1–4096 UTF-8 bytes without NUL or line breaks;
+spaces, quotes, backslashes and Unicode are preserved and safely encoded in the
+Redis configuration. Stdin supplies the password once (no confirmation line).
+
+Init writes private files, creates authenticated Redis with persistence disabled,
+publishes only the supplied host IP, and waits at most 30 seconds for authenticated
+readiness after Docker startup. Each Docker operation is bounded (image/container
+creation: 120 seconds; other operations: 10–20 seconds). It saves ownership before
+Docker creation so an interrupted setup is recoverable. No command displays the
+saved password.
+
+Allow the Redis TCP port through the host firewall **only from intended client
+hosts**. Docker publishing/firewall behavior is platform-specific; check the actual
+rules, especially with Docker Desktop/WSL or VPN routing. Swarmcrawl does not alter
+or verify them. **Redis connections are plaintext TCP, not TLS**: use a trusted
+isolated LAN or private VPN, never a public interface/Internet port forward.
+Authentication is not encryption. Every Redis client is trusted; namespaces are
+state separation, not access control. Nodes need no inbound crawler port.
+
+### 2. Inspect connection details and share your password securely
+
+In another terminal on the owner PC:
+
+```sh
+swarmcrawl cluster info
+```
+
+Example output for the address above:
+
+```text
+Saved connection (not transient flag/environment overrides):
+IP: 192.168.1.50
+Port: 6379 (default)
+Database: 0 (default)
+Namespace: swarmcrawl:v1 (default)
+```
+
+Info is offline: no Docker or Redis connection is required. It shows the **saved**
+settings, never a username/password or full credential-bearing URL. Values matching
+built-in defaults carry `(default)`; `127.0.0.1` also gets that marker, but init still
+requires you to supply it explicitly. A joined DNS endpoint is shown as `Host:`
+without resolving it or claiming an IP. Info is not a connectivity or firewall check.
+
+Share your chosen password through an authenticated secure channel, such as your
+password manager. Do not put it into command arguments, shell history, chat logs,
+or the repository. Share the address/port/database/namespace from info too; ordinary
+init output also prints a non-secret join command. `cluster credential` has been
+removed—there is no password-reveal command.
+
+### 3. Second PC (no Docker required)
+
+```sh
+swarmcrawl cluster join 192.168.1.50
+# Enter the shared password at the hidden prompt.
+swarmcrawl node
+```
+
+Replace the example address. If the owner selected other settings, copy them exactly:
+
+```sh
+swarmcrawl cluster join 192.168.1.50 --port 6380 --database 3 --namespace mycrawl:v1
+```
+
+Joining runs an authenticated PING and saves only on success. It does not register
+a node, install a server, or prove namespace agreement/firewall restrictions. An
+unused or wrong namespace can still PING. Database selection is 0–15 for this managed
+Redis; `--username` supports a named ACL user when joining an existing deployment.
+
+For automation, use `--password-stdin` with one password line from a protected file
+or a secret-manager pipe, never a literal password in the shell command:
+
+```sh
+swarmcrawl cluster join 192.168.1.50 --password-stdin < /private/path/redis-password
+```
+
+The normal hidden prompt requires a terminal; noninteractive invocations must opt
+into stdin. Password input is limited to 4096 bytes, excluding its line ending.
+
+### 4. Submit and observe from either PC
+
+Keep both foreground nodes running. In another terminal, with no environment setup:
+
+```sh
+swarmcrawl check
+swarmcrawl submit https://example.org/docs/
+swarmcrawl status -f 1
+swarmcrawl stats 1
+```
+
+Use your own target and the job ID actually returned by `submit`. The target must
+be reachable from **every node** (not one PC's loopback HTTP server). Finished results
+remain available after nodes exit while Redis remains running.
+
+### 5. Shutdown and subsequent startup
+
+First press **Ctrl-C in every node terminal and wait for each node to exit**. This
+stops new claims and drains owned work. Then, on the Redis owner PC:
+
+```sh
+swarmcrawl cluster stop
+# Read the data-loss warning and type: stop
+# Automation, only after stopping nodes: swarmcrawl cluster stop --yes
+```
+
+**ALL Redis jobs, IDs and results in every database/namespace are permanently lost.**
+Redis is disposable (`save ""`, `appendonly no`); this is not a backup/persistence
+feature. The CLI cannot prove remote nodes have stopped. Stop removes only its
+matching owned container, retaining private credentials/configuration. A joining
+PC cannot use start/stop to affect the remote owner. Later, on the owner:
+
+```sh
+swarmcrawl cluster start
+swarmcrawl node
+# Second PC: swarmcrawl node
+```
+
+Start recreates a removed container from the private settings and credentials.
+An already-running owned Redis is checked, **not restarted**; its jobs are preserved.
+Container names alone never establish ownership: the saved random deployment identity
+must match explicit Docker ownership labels, and operations then use the exact ID.
+There is no background node service, SSH deployment, crash recovery or new control plane.
+
+### 6. Remove the cluster and initialize again (no backup)
+
+To discard the deployment rather than retain its settings for `start`, gracefully
+stop **all nodes** and wait for them to exit, then on the owner PC:
+
+```sh
+swarmcrawl cluster remove
+# Read the warning and type: remove
+# Deliberate automation: swarmcrawl cluster remove --yes
+swarmcrawl cluster init 192.168.1.50
+# Choose a password again, then restart/rejoin nodes as needed.
+```
+
+Removal stops/removes only the label-verified owned Redis container and deletes
+`redis.conf` and `config.json`, including the saved credential. **No backup is made;
+all jobs/results in every database are lost.** It works after `stop` or incomplete
+initialization too. A Docker ownership/removal failure retains local recovery
+metadata instead of silently forgetting a potentially running deployment.
+
+On a **joining PC**, `cluster remove` only deletes its local saved connection and
+credential; it does not contact Docker or change remote Redis or jobs. Stop that
+PC's nodes first. You can then `cluster join` another deployment. Owner removal
+cannot erase saved settings from remote PCs: remove/rejoin there if settings or
+passwords change.
+
+Removal deletes only known connection files, not arbitrary contents of the user
+configuration directory or shared Docker images. An empty `deployment.lock` and
+the private directory remain so removal and reinitialization cannot race on different
+lock files; these contain no deployment settings or credentials. No manual file
+moving or backups are required to initialize again. File deletion is not a promise
+of forensic secure erasure or deletion of backups you made separately.
+
+### Saved configuration and diagnostics
+
+One configuration is stored outside the repository:
+
+- Linux/WSL: `$XDG_CONFIG_HOME/swarmcrawl/` if set, otherwise
+  `~/.config/swarmcrawl/`.
+- macOS: `~/Library/Application Support/swarmcrawl/`.
+- `SWARMCRAWL_CONFIG_DIR` can select an **absolute** private directory (useful for
+  isolated tests); it is a location override, not a deployment-profile framework.
+
+The directory must be owned by this user with mode `700`; `config.json`, the owner’s
+`redis.conf`, and the lifecycle lock use mode `600`. Do not share these files or put
+backups in a public directory. Files/symlinks with unsafe ownership/permissions are
+rejected rather than silently relaxed. The Redis process runs as the host file
+owner with an explicit entrypoint, read-only mount/root filesystem and dropped
+capabilities, so the mounted `600` configuration need not be world-readable. The
+Docker daemon and host account remain trusted. Bind mounts require a local daemon
+and a host directory Docker can access (macOS/Desktop may require file sharing).
+
+- **Repeat init/join:** refuses to replace any saved configuration, even with the
+  same endpoint. Use `cluster start` for the owner; just run `node` on a joined PC.
+  To deliberately switch deployments/IP, gracefully stop nodes and use confirmed
+  `cluster remove` before a fresh init/join. Existing jobs are not migrated or backed
+  up. Use `cluster info` to inspect saved settings without exposing credentials.
+- **Docker unavailable:** install/start Docker yourself; check daemon permissions,
+  Linux-container mode and WSL integration. No automatic package installation occurs.
+- **Docker command failed:** errors identify the operation (for example `docker
+  create` versus `docker start`), exit status and a safe diagnostic category:
+  `[bind-address]` for an unavailable host IP, `[host-port]` for an occupied/reserved
+  or denied port, `[config-mount]` for private configuration mount failures, and
+  `[image-access]` for image/registry or credential-helper failures. Daemon access,
+  permission, name-conflict and exhausted-storage errors have separate hints too.
+  Classification uses known Docker messages; unrecognized/localized messages report
+  `[unclassified]`, never raw output. Do not change to all-interface publishing or
+  relax credential-file permissions as a workaround.
+
+  If an older installed binary only prints the generic error, run the updated source
+  from the repository without deleting your saved configuration:
+
+  ```sh
+  cargo run --locked -- cluster info
+  cargo run --locked -- cluster start
+  ```
+
+  The second command retries owned setup and does not restart an already-running
+  Redis. For help, share the safe error, info output, exact command (no password),
+  and whether this is Linux, WSL/Docker Desktop, or macOS. Do **not** share
+  `config.json`, `redis.conf`, passwords or raw container/daemon logs. An example IP
+  in this README is not necessarily assigned to your PC; in WSL, distinguish the
+  Windows-side LAN/VPN address from the WSL virtual address.
+- **Partial init / busy port:** settings are retained, never overwritten or deleted.
+  Free the chosen port or restore the selected interface, then `cluster start`.
+  Docker Desktop can retain broken forwarding after a failed bind; after stopping
+  nodes, `cluster stop --yes` then `cluster start` recreates only the owned container
+  (destructive: all Redis data is lost). No automatic destructive recovery occurs.
+- **Readiness timeout:** check the exact bind/port, Docker mount access, local
+  routing/firewall and private-file permissions. Setup/start never report ready
+  without authenticated PING. Raw Docker/server diagnostics are withheld to avoid
+  leaking secrets; CLI errors name safe likely causes.
+- **Join/check fails:** check the owner is running, address/port, credential and
+  selected database. Never use the second PC's loopback address for the owner.
+  A failed join writes no connection file and can be retried.
+- **Unexpected job IDs/results:** confirm the same database and namespace on every
+  PC; PING cannot do that. Check for overriding flags or old environment variables.
+- **Cluster endpoint overrides:** cluster commands deliberately reject `--redis-url`
+  / `SWARMCRAWL_REDIS_URL`; init uses its required IP, join uses its HOST, and lifecycle
+  uses saved ownership. Unset an old Redis URL variable first. Init/join honor the
+  global namespace flag/environment; info/start/stop/remove use saved metadata.
+
+Physical two-PC networking and native macOS setup are not verified by local process
+checks. The existing no-saved-config flag/environment workflow remains available.
+
 ## Start a development Redis
+
+This optional manual, unauthenticated loopback-only fixture remains useful for
+protocol development/tests; normal users can use `cluster init` instead.
 
 Use an unused local port (6379 below) and an unused container name:
 
@@ -85,40 +362,19 @@ Cleanup targets only this development container:
 docker stop swarmcrawl-redis-dev
 ```
 
-The default published address is loopback, **not all interfaces**. For clients on
-other machines, publish on the Redis host's private/trusted interface instead of
-`127.0.0.1`, restrict its firewall to the trusted node/CLI hosts, and configure Redis
-ACL/passwords through a private configuration file. Point each client at that
-host's reachable IP, not its own loopback address, and run `swarmcrawl check` from each
-host. Do not expose Redis to the public Internet or disable security protections.
-The current build supports plain TCP `redis://` only, not TLS (`rediss://`) or Unix
-sockets; credentials on plaintext TCP require a trusted isolated network.
-Physical multi-host connectivity has not been verified yet. For an actual multi-host
-setup:
-
-1. On the Redis host, keep its ACL/password configuration **outside the repository**
-   with restrictive file permissions. Use a Docker bind mount for that configuration
-   and start `redis-server` with its mounted path; do not put passwords on the command
-   line. Publish `TRUSTED_REDIS_IP:6379:6379`, where the IP belongs to a private host
-   interface, rather than the loopback binding in the development command.
-2. Allow TCP 6379 through that host's firewall **only from the intended node/CLI
-   hosts**. Keep Redis protected mode/authentication enabled. A namespace is state
-   isolation, not access control; every Redis client is trusted.
-3. Build the same revision on each node/CLI host. Supply `SWARMCRAWL_REDIS_URL`
-   externally with the Redis host's reachable address and configured authentication.
-   Use the same Redis database and `SWARMCRAWL_JOB_NAMESPACE` on every client;
-   verify `swarmcrawl check` from each machine before starting host-run nodes.
-4. Submit a target reachable from **every node**, not a node's loopback HTTP address.
-   Redis hosts do not need access to the website, and nodes need no inbound crawler
-   port. The supplied demo server intentionally cannot serve other hosts.
-
-Do not change repository visibility or claim physical multi-host verification just
-because multiple processes on one host pass.
+The published address is loopback, **not all interfaces**. Do not expose this
+unauthenticated fixture to other PCs; use the authenticated [managed setup](#cli-managed-two-pc-setup).
+If saved configuration already exists, explicitly select the fixture with
+`--redis-url redis://127.0.0.1:6379/0` (and a test namespace for job commands).
+Plain TCP `redis://` is supported, not TLS (`rediss://`) or Unix sockets.
+The supplied demo HTTP server intentionally cannot serve other hosts.
 
 ## CLI configuration
 
 Global options may appear before or after any subcommand. Precedence is
-**explicit flag > environment variable > built-in default**. Values are validated
+**explicit flag > environment variable > saved configuration > built-in default**.
+Saved configuration supplies the Redis URL (including database/authentication) and
+namespace; Redis/HTTP deadlines still use flags/environment/defaults. Values are validated
 after selection, so an overridden invalid environment value does not cause failure.
 Environment settings use the `SWARMCRAWL_*` names listed below.
 
@@ -136,16 +392,16 @@ SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6380/0 swarmcrawl check --redis-timeout-s
 ```
 
 Use `./target/debug/swarmcrawl` unless the binary has been installed or added to PATH.
-Prefer an externally supplied environment variable rather than command-line URLs
-for credentials (command lines can appear in shell history/process listings).
+Prefer `cluster init` / `join` saved credentials, or an externally supplied environment
+variable rather than command-line URLs (command lines can appear in shell history/process listings).
 Never commit actual credentials. Help hides environment values; configuration
 Debug output redacts connection information; errors include a safe operation/error
 category, not raw URLs, server error messages, or credentials. Success goes to stdout
 and errors to stderr. Exit codes: `0` success/help/version, `1` configuration or
 runtime failure, `2` command-line syntax/usage errors, `130` interrupted status
-follow. A failed-job status prints its diagnostic snapshot then exits `1`; failed
-or unfinished stats exit `1` without partial numbers. Nodes report safe PID/job/
-operation context to stderr and never log base URLs, request queries or Redis
+follow. A failed/aborted-job status prints its diagnostic snapshot then exits `1`;
+failed, aborted or unfinished stats exit `1` without partial numbers. Nodes report
+safe PID/job/operation context to stderr and never log base URLs, request queries or Redis
 credentials. Node runtime errors exit nonzero only after draining other owned work.
 
 `node` additionally accepts these implemented settings with the same precedence:
@@ -177,6 +433,10 @@ Replace these example loopback URLs with your own reachable HTTP(S) bases:
 ./target/debug/swarmcrawl status 1
 ./target/debug/swarmcrawl status -f 1
 ./target/debug/swarmcrawl stats 1
+./target/debug/swarmcrawl jobs
+# Deliberate, permanent abort (choose one, when needed):
+./target/debug/swarmcrawl abort 2
+./target/debug/swarmcrawl abort --all
 # Same deployment namespace can be set before or after any job command:
 ./target/debug/swarmcrawl --namespace swarmcrawl:v1 status 1
 ./target/debug/swarmcrawl stats 1 --namespace swarmcrawl:v1
@@ -188,7 +448,7 @@ Replace these example loopback URLs with your own reachable HTTP(S) bases:
   without echoing it. With valid inputs, submit sequentially through Redis, print
   and flush one ID per input in input order, and return **without waiting for any
   node or HTTP request**. Canonical duplicates return `existing`, including after
-  completion or failure; they never restart a job. URLs are not printed because
+  completion, failure or abort; they never restart a job. URLs are not printed because
   queries may contain secrets. `created`/`existing` describes submission identity,
   not crawl success.
 - Submission writes are **not a batch transaction**: a later Redis/output failure
@@ -199,13 +459,14 @@ Replace these example loopback URLs with your own reachable HTTP(S) bases:
   `job 1  crawled 12  frontier 3  in flight 2  files 9  discovered 17  running`.
   **crawled means processed unique URL attempts**, including redirects and broken
   links; `files` means successful existing files, not just HTML. `discovered` equals
-  crawled + frontier + in flight. State is `running`, `done`, or `failed` with a safe
-  failure category. No URL/query appears in the snapshot. Running/done snapshots
-  exit `0`; failed snapshots exit `1` with a final-statistics-unavailable error.
+  crawled + frontier + in flight. State is `running`, `done`, `aborted`, or `failed`
+  with a safe failure category. No URL/query appears in the snapshot. Running/done
+  snapshots exit `0`; failed/aborted snapshots exit `1` with a final-statistics-unavailable
+  error. Failed/aborted counts are frozen diagnostics, not live network activity.
 - **`status -f <job>` / `status --follow <job>`:** print an immediate snapshot, then
   poll **500 ms after each bounded Redis read** and print only changed snapshots.
   Intermediate changes between polls may be coalesced. Exit `0` at done or `1` at
-  failed/Redis error/unknown ID; an already-terminal job prints once and exits.
+  failed/aborted/Redis error/unknown ID; an already-terminal job prints once and exits.
   Ctrl-C while following exits `130` with an interruption message. It stops only
   this observer, **not the crawl**, and performs no job writes. There is no overall
   follow deadline: a queued job without nodes keeps waiting until interrupted.
@@ -213,7 +474,7 @@ Replace these example loopback URLs with your own reachable HTTP(S) bases:
   `files`, `extensions`, and `words`, then one extension/count per line in sorted
   extension order. For example, `files: 3   extensions: 2   words: 4` followed by
   `html 2` and `jpg 1`. Zero-file completed jobs are valid. Full unsigned word totals
-  remain exact, not floating-point. Running, failed, unknown, or corrupt jobs exit
+  remain exact, not floating-point. Running, failed, aborted, unknown, or corrupt jobs exit
   `1` without printing partial totals. A new CLI can read results immediately when
   done, with no node restart/manual finalization; results remain after nodes exit.
 
@@ -221,12 +482,56 @@ Job IDs are positive canonical decimal integers, local to a Redis database and
 namespace. Invalid IDs are rejected before connecting; unknown IDs suggest checking
 that configuration. Redis and CLI output errors are nonzero, not success messages.
 Only the `node` command creates an HTTP fetcher or executes crawler work. There is
-no direct CLI-to-node connection and no job cancellation/reset command.
+no direct CLI-to-node connection and no individual job reset/resume command.
+
+### List and abort jobs
+
+- **`jobs`:** list every retained job in the selected Redis database/namespace in
+  numeric ID order, including `running`, `done` (completed), `failed`, and `aborted`.
+  Each row uses the same coherent counters as `status`; rows can represent different
+  instants, not one global snapshot. No URLs or credentials are printed. The ID set
+  is captured once from retained submissions, so later submissions appear on the next
+  invocation. An empty namespace prints `No jobs...`. Listing failed/aborted jobs is
+  successful (exit `0`); Redis/corrupt-data/output errors exit `1`, possibly after
+  earlier rows were printed. This simple listing loads all retained IDs into memory,
+  then reads one bounded snapshot per ID; it is not a paginated history service.
+- **`abort <job>`:** atomically move a running job to permanent `aborted` state and
+  remove it from scheduling. Prints `job <id>  aborted`. Unknown/invalid/corrupt jobs
+  return a nonzero error without resetting their data. A completed, failed, or
+  already-aborted job is unchanged (exit `0`); completed statistics remain readable.
+  The explicit command is confirmation—there is no further prompt.
+- **`abort --all`:** capture the current active-job set and abort it in numeric ID
+  order in the **selected database/namespace only**, not every Redis database or
+  namespace. Each transition is atomic; the batch is **sequential, not all-or-nothing**.
+  It does not include jobs submitted after that set was captured or keep future
+  jobs from running. A job finishing before its abort is reported unchanged. A later
+  failure exits `1` but earlier aborts remain in effect; output is flushed per job.
+  Ambiguous writes are never automatically retried; inspect `jobs`/`status` afterward.
+
+An abort prevents **new Redis claims and late result/link publication**, not instant
+network interruption. Tasks already owning URLs may still start/finish their requests
+under existing HTTP deadlines (default 30 seconds), then discard both successes and
+errors without shutting down the node. Nodes continue serving other/future jobs.
+The CLI does not wait for drain or prove that all remote requests have ended; HTTP
+body deadlines do not bound synchronous parsing CPU time. Gracefully stop nodes and
+wait for exit before stopping/removing Redis, even after `abort --all`.
+
+Aborted frontier/owner sets and partial counters remain **frozen for diagnosis**;
+`in flight` therefore reflects ownership at abort, not a current socket count.
+`status -f` exits `1` on abort and `stats` refuses partial results. Abort does not
+remove the submission identity: resubmitting the same canonical URL returns the
+same aborted job, not a retry. There is no resume, reclaim or per-job deletion.
+This requested maintenance feature extends the baseline's optional cancellation
+scope without adding killed-node recovery.
+
+**Upgrade every node and CLI to this version before using abort.** Existing jobs and
+submission indexes need no migration, but older binaries do not understand `aborted`
+and may exit on it. Mixed-version abort handling is not supported.
 
 ## How the components fit together
 
 ```text
-CLI submit/status/stats ──────► one Redis (Docker)
+CLI submit/status/stats/jobs/abort ─► one Redis (Docker)
                                   ▲  ▲  ▲
                                   │  │  │ atomic ownership/publication
                               host crawler nodes (Tokio)
@@ -408,7 +713,7 @@ not count as files; successful eligible targets do, using their own extensions.
 
 ## Redis job storage and read contracts
 
-The library exposes `jobs::JobStore::{connect, submit, snapshot, stats}` plus the
+The library exposes `jobs::JobStore::{connect, submit, jobs, abort, snapshot, stats}` plus the
 frontier operations described below. It uses an async multiplexed connection and
 the shared `RedisConfig`, with a deadline for
 connection setup and each operation. `submit` accepts a validated `CrawlUrl`; it
@@ -448,7 +753,7 @@ trusted/private, and neither diagnostics nor Debug output should expose them.
 ### Atomic submission
 
 One small `EVAL` transition checks the canonical submission hash first. An existing
-base returns its retained ID, including for a completed or failed job, without
+base returns its retained ID, including for a completed, failed or aborted job, without
 adding another seed or restarting it. A new base gets a sequence ID, running
 metadata, seen seed, one frontier entry, zero statistics, submission mapping and
 active membership together. All clients use this same transition; no local lock
@@ -475,11 +780,12 @@ The snapshot reports:
 - `frontier`, `in_flight`, `discovered`: waiting URLs, owned URLs, and all discovered
   URLs. Validate `discovered = processed + frontier + in_flight` with checked sums.
 - `successful_files`: existing files only, at most `processed`, from the aggregate.
-- `state`: `running`, `done`, or `failed` with a fixed `fetch`, `statistics`, or
-  `protocol` failure category. Running requires outstanding work; done requires
-  an empty frontier and no owners. Failed may retain outstanding diagnostic state
-  and can never supply final statistics. Failure freezes outstanding diagnostic
-  state; future nodes must stop claiming that job and drain their network tasks.
+- `state`: `running`, `done`, `aborted`, or `failed` with a fixed `fetch`, `statistics`,
+  or `protocol` failure category. Aborted uses an empty failure field. Running requires
+  outstanding work; done requires an empty frontier and no owners. Failed/aborted
+  retain outstanding diagnostic state and can never supply final statistics. Both
+  freeze diagnostic state; nodes stop claiming those jobs and drain owned network
+  tasks. Abort is deliberate user intent, not a node operational failure.
 
 Submission starts at `(discovered, processed, frontier, in_flight, successful_files)
 = (1, 0, 1, 0, 0)`. Unknown jobs report an explicit error. Invalid metadata, key
@@ -489,8 +795,8 @@ All stored counters/totals are canonical unsigned decimal strings: no negative,
 signed, padded, fractional or exponential forms. Reads preserve the target's full
 `usize` and `u64` ranges, including words above `i64::MAX`, and reject overflow.
 
-`stats` returns validated `WebStats` **only for done jobs**; running and failed jobs
-return distinct errors rather than partial statistics. Its state/result reads are
+`stats` returns validated `WebStats` **only for done jobs**; running, failed and aborted
+jobs return distinct errors rather than partial statistics. Its state/result reads are
 coherent with the atomic publisher below; there is no separate finalization step.
 An empty frontier with owned work remains running.
 
@@ -513,8 +819,9 @@ rests on these invariants:
 4. The same script marks `done` and removes active membership only when both the
    frontier and in-flight hash are empty. Aggregates are already stored when done
    becomes visible, so a new reader can immediately obtain final `WebStats`.
-5. Done/failed states never return to running. Failures retain diagnostic state,
-   remove active membership and never expose partial aggregates as final results.
+5. Done/failed/aborted states never return to running. Failure and abort retain
+   diagnostic state, remove active membership and never expose partial aggregates
+   as final results.
    Redis interruption/ambiguous writes and abrupt worker loss remain unsupported.
 
 Redis serializes each script across processes; local mutexes are not involved.
@@ -544,7 +851,14 @@ The implemented library API is:
   but publication returns the retained failure and makes no changes. No new claims,
   links, contributions or restart are allowed; partial stats never become final.
 
-Publication returns `Published { done }`, `AlreadyCompleted`, or `Failed(reason)`.
+- `abort(job)`: use the same shared protocol preflight and atomic Lua boundary as
+  claims/publication. Transition running → aborted and remove active membership;
+  return unchanged for any terminal job. If completion wins the race first, final
+  results are preserved. If abort wins, later owned successes/failures return
+  `Aborted` without mutation. A claim serialized before abort remains diagnostic
+  ownership; one serialized afterward returns no work.
+
+Publication returns `Published { done }`, `AlreadyCompleted`, `Aborted`, or `Failed(reason)`.
 Repeating a published claim is a safe no-op, even with a different outcome/links;
 wrong ownership or namespace is an error, never another contribution. Claims are
 not serialized or transferred between workers. Clones can use the same claim, but
@@ -639,6 +953,18 @@ live namespace or promise resumability after these excluded failures.
 
 ## Quality gates and tests
 
+Abort/listing maintenance coverage runs in the regular Redis smoke suite:
+`tests/redis_jobs.rs` checks retained listing, exact numeric ordering through
+`i64::MAX`, existing indexes and corrupt IDs; `tests/redis_frontier.rs` checks
+racing aborts, claims and final publication, no late contributions/discoveries,
+retained identities, unchanged completed/failed results and fail-closed corruption.
+`tests/cli_jobs.rs` checks listing all four states, namespace-only abort-all and
+honest partial-batch failure. A gated two-node test aborts with 20 owners plus queued
+work, then releases successful HTML and HTTP 503s: late links/results are discarded,
+follow exits, stats stay unavailable, both nodes remain usable for a healthy job,
+and normal graceful shutdown succeeds. These local process tests do not claim
+immediate HTTP interruption or physical multi-host verification.
+
 Run all of these for relevant changes (CI uses the same commands):
 
 ```sh
@@ -648,6 +974,39 @@ cargo test --locked
 cargo build --locked
 bash scripts/redis-smoke.sh
 ```
+
+Managed setup tests (Unix + GNU `timeout`) are in `tests/cluster_setup.rs`. Default
+cases cover saved/environment/flag precedence, secret-free info/default markers,
+required IP and password validation, private-file modes and symlink rejection,
+failed join, repeat init/join refusal, unavailable Docker, safe operation/cause
+classification without copying diagnostic payloads, partial setup metadata,
+ownership rejection, removal confirmation, lock safety and preservation of unrelated
+files. Fake Docker tests cover failure contracts, not provisioning compatibility.
+Run the **real Docker and interactive PTY** cases separately (also run in CI;
+Python 3 is required for the PTY case):
+
+```sh
+cargo test --locked --test cluster_setup -- --ignored --test-threads=1
+```
+
+It provisions authenticated Redis on an isolated loopback port, verifies no-password
+and wrong-password rejection, joins with Docker absent, checks shared database/namespace
+job visibility, preserves jobs on repeated start, rejects unconfirmed stop/remove,
+verifies stop/start data loss and retained user-supplied credentials (including
+spaces, quotes, backslashes, Unicode and the 4096-byte boundary), retains compatibility
+with earlier generated-hex configuration files, verifies real port-conflict diagnostics/recovery,
+and refuses an unrelated container with a matching name but missing ownership labels.
+It also verifies owner removal and fresh initialization, and joined-PC removal/rejoin
+without touching remote Redis. RAII cleanup removes only test-created resources even
+after assertions fail. Each CLI process is bounded to 180 seconds and Docker cleanup
+to 130 seconds.
+
+`scripts/test-cluster-terminal.py` drives actual Unix pseudo-terminals with a fake
+Docker executable. It checks hidden passwords without echo, init confirmation mismatch,
+explicit-IP enforcement, rejection/acceptance of stop/remove confirmation, no-backup
+cleanup and the hidden join prompt. Each terminal process is bounded to ten seconds
+and killed/reaped on failure; the entire script has a 60-second test deadline. This
+checks interactive safety, not Docker provisioning or physical two-PC networking.
 
 Default tests require no external Redis: domain policy and checked-arithmetic
 unit tests, library configuration/redaction checks, local silent TCP peers for
@@ -703,7 +1062,7 @@ SWARMCRAWL_REDIS_URL=redis://127.0.0.1:6379/0 \
 
 The connectivity test only sends PING. `tests/support/mod.rs` shares an isolated
 namespace/cleanup harness for Redis and node-process suites, deleting only
-test-owned keys after success or assertion failure. Seven tests in `tests/redis_jobs.rs` check:
+test-owned keys after success or assertion failure. The original seven tests in `tests/redis_jobs.rs` check:
 32 independently connected racing submissions; four independent submission
 processes released through a Redis gate; different-base isolation and retention;
 exact final-result fixture reads through `u64::MAX`; invalid/schema/overflow
@@ -715,7 +1074,7 @@ The nested panic in the cleanup test is expected, not a suppressed product failu
 Completed/failed states in the storage-read suite are **test fixtures**; the frontier
 suite separately tests their actual production.
 
-Seven tests in `tests/redis_frontier.rs` check 32 concurrent parent discoveries;
+The original seven tests in `tests/redis_frontier.rs` check 32 concurrent parent discoveries;
 32 competing claimers for two shared children; 32 publications of the same claim
 with one contribution; a gated last parent publishing children while another job
 finishes independently; empty valid results and overlapping per-job URLs; coherent
@@ -757,7 +1116,7 @@ The fetcher suite separately establishes encoding boundaries. The distributed su
 below adds broader traversal, node-count equivalence and actual-node non-HTML
 cancellation; physical multi-host networking remains unverified.
 
-`tests/cli_jobs.rs` adds eight opt-in cases using independent real user-command
+The original eight opt-in cases in `tests/cli_jobs.rs` use independent real user-command
 processes, the same isolated Redis harness, and actual nodes/gated HTTP where
 applicable. They prove multi-input nonblocking submission with no nodes and no
 HTTP from user commands; retained fragment-duplicate IDs; rejected mixed-input
@@ -904,6 +1263,10 @@ demo, grading tag, post-demo publication and LMS submission still require the
 
 - `src/main.rs`: Clap presentation, shared configuration-source selection, command
   dispatch and exit behavior; no Redis schema or network policy in CLI parsing.
+- `src/cluster.rs`: explicit-IP setup, hidden/stdin password input, non-secret info,
+  authenticated readiness and label-verified owned Docker lifecycle/removal.
+- `src/saved.rs`: private per-user connection storage, atomic no-overwrite publication,
+  permissions checks and local setup/lifecycle locking.
 - `src/commands.rs`: Redis-only user-command execution, whole-batch URL validation,
   safe ordered IDs, coherent status/follow presentation and final-only sorted stats.
 - `src/config.rs`: validated Redis/HTTP deadlines and typed, secret-safe errors.
@@ -914,10 +1277,10 @@ demo, grading tag, post-demo publication and LMS submission still require the
 - `src/redis.rs`: async multiplexed Redis connectivity and bounded read-only check.
 - `src/jobs.rs`, `src/jobs/submit.lua`: typed job IDs/states, bounded async Redis
   storage, atomic submission/seed initialization and transactional validated reads.
-- `src/jobs/frontier.rs`, `src/jobs/{worker,protocol,claim,complete}.lua`: fresh
+- `src/jobs/frontier.rs`, `src/jobs/{worker,protocol,claim,complete,abort}.lua`: fresh
   process identities, typed ownership, scope filtering, preflight/exact decimal
   arithmetic, and atomic claiming,
-  publication, failure and finalization.
+  publication, failure, abort and finalization.
 - `src/urls.rs`: canonical HTTP(S) identity, resolution, scope and path extensions.
 - `src/html.rs`: MIME classification, full synchronous link/text extraction.
 - `src/stats.rs`: required `WebStats` and validated checked aggregation.
@@ -941,10 +1304,16 @@ scripting disabled; it adds no second parser. Reqwest has only Rustls/gzip featu
 decoding; dev-only `flate2` generates deterministic compressed HTTP fixtures.
 Redis default features remain off; submission uses direct `EVAL`, not the optional
 script-cache helper, so no extra script/hash dependency is needed.
+Managed setup uses `dirs` for the per-user location, `rpassword` for hidden terminal
+input, and OS-backed `getrandom` for ownership tokens (passwords are user-supplied). `serde`/`serde_json` encode the private configuration and parse
+Docker labels; `tempfile` publishes complete files without overwriting; `rustix`
+provides safe Unix UID/GID access for permission checks and the container user.
+Tokio's process feature bounds Docker subprocesses; a standard-library file lock
+serializes local setup/lifecycle operations.
 
-Baseline crash recovery, cancellation, robots/politeness, and JavaScript rendering
-remain excluded by the assignment. A working connectivity check alone does not
-exercise the library's cluster ownership, completion or final-statistics guarantees.
+Crash recovery, robots/politeness, and JavaScript rendering remain excluded.
+Explicit job abort is an owner-requested extension beyond the assignment baseline.
+A working connectivity check alone does not exercise the library's cluster ownership, completion or final-statistics guarantees.
 
 ## Manual sites and peer comparison
 
@@ -993,5 +1362,5 @@ Technical final-audit evidence and owner confirmations must be recorded separate
 - [ ] Submit the repository URL on the course LMS and retain confirmation.
 
 No crash-recovery challenge, browser rendering, cancellation or politeness system
-is required for the baseline. Demo readiness does not imply that the live demo,
+is required for the baseline; the explicit abort command is a later requested extension. Demo readiness does not imply that the live demo,
 visibility change, grading tag or LMS delivery is finished.

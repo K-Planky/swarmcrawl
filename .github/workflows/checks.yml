@@ -25,5 +25,7 @@ jobs:
         run: cargo build --locked
       - name: Demo fixture controls
         run: python3 -B -m unittest discover -s demo -p 'test_*.py'
+      - name: CLI-managed authenticated setup and lifecycle
+        run: cargo test --locked --test cluster_setup -- --ignored --test-threads=1
       - name: Real Docker Redis and distributed process checks
         run: bash scripts/redis-smoke.sh

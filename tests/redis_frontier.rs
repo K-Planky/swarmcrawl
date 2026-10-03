@@ -16,6 +16,155 @@ use swarmcrawl::{
 };
 use tokio::task::JoinSet;
 
+#[tokio::test]
+#[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
+async fn abort_is_idempotent_freezes_late_publications_and_preserves_terminal_jobs() {
+    with_redis(|context| async move {
+        let store = context.store().await;
+        let base = CrawlUrl::parse("https://example.org/abort/").unwrap();
+        let job = store.submit(&base).await.unwrap().job;
+        let claim = store.claim(job, &worker(0)).await.unwrap().unwrap();
+        let before = store.snapshot(job).await.unwrap();
+        let mut racers = JoinSet::new();
+        for _ in 0..32 {
+            let context = context.clone();
+            racers.spawn(async move { context.store().await.abort(job).await.unwrap() });
+        }
+        let mut changes = 0;
+        while let Some(result) = racers.join_next().await {
+            changes += usize::from(result.unwrap());
+        }
+        assert_eq!(changes, 1);
+        let mut expected = before;
+        expected.state = JobState::Aborted;
+        assert_eq!(store.snapshot(job).await.unwrap(), expected);
+        assert_eq!(store.stats(job).await, Err(StoreError::JobAborted));
+        assert!(store.active_jobs().await.unwrap().is_empty());
+        assert!(store.claim(job, &worker(1)).await.unwrap().is_none());
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .complete(&claim, file(7), &[base.resolve("late").unwrap()])
+                    .await
+                    .unwrap(),
+                Completion::Aborted
+            );
+            assert_eq!(
+                store.fail(&claim, JobFailure::Fetch).await.unwrap(),
+                Completion::Aborted
+            );
+        }
+        assert_eq!(store.snapshot(job).await.unwrap(), expected);
+        assert_eq!(store.submit(&base).await.unwrap().job, job);
+        assert!(!store.submit(&base).await.unwrap().created);
+        assert_eq!(
+            store.abort("999".parse().unwrap()).await,
+            Err(StoreError::UnknownJob)
+        );
+
+        let done = store
+            .submit(&base.resolve("done").unwrap())
+            .await
+            .unwrap()
+            .job;
+        let claim = store.claim(done, &worker(0)).await.unwrap().unwrap();
+        store.complete(&claim, file(2), &[]).await.unwrap();
+        let stats = store.stats(done).await.unwrap();
+        assert!(!store.abort(done).await.unwrap());
+        assert_eq!(store.stats(done).await.unwrap(), stats);
+        let failed = store
+            .submit(&base.resolve("failed").unwrap())
+            .await
+            .unwrap()
+            .job;
+        let claim = store.claim(failed, &worker(0)).await.unwrap().unwrap();
+        store.fail(&claim, JobFailure::Fetch).await.unwrap();
+        let before = store.snapshot(failed).await.unwrap();
+        assert!(!store.abort(failed).await.unwrap());
+        assert_eq!(store.snapshot(failed).await.unwrap(), before);
+
+        let corrupt = store
+            .submit(&base.resolve("corrupt").unwrap())
+            .await
+            .unwrap()
+            .job;
+        context
+            .hash_set(
+                &context.job_key(corrupt, "meta"),
+                "processed",
+                "fixture-secret",
+            )
+            .await;
+        assert!(matches!(
+            store.abort(corrupt).await,
+            Err(StoreError::InvalidData(_))
+        ));
+        assert_eq!(
+            context
+                .query::<String>(
+                    redis::cmd("HGET")
+                        .arg(context.job_key(corrupt, "meta"))
+                        .arg("state")
+                )
+                .await,
+            "running"
+        );
+        assert_eq!(store.active_jobs().await.unwrap(), [corrupt]);
+        assert_eq!(store.jobs().await.unwrap(), [job, done, failed, corrupt]);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis; run scripts/redis-smoke.sh"]
+async fn abort_races_claim_and_final_publication_without_partial_transitions() {
+    with_redis(|context| async move {
+        let store = context.store().await;
+        for index in 0..32 {
+            let base = CrawlUrl::parse(&format!("https://example.org/race/{index}/")).unwrap();
+            let job = store.submit(&base).await.unwrap().job;
+            let peer = context.store().await;
+            let worker = worker(index);
+            let (claim, aborted) = tokio::join!(store.claim(job, &worker), peer.abort(job));
+            assert!(aborted.unwrap());
+            if let Some(claim) = claim.unwrap() {
+                assert_eq!(
+                    store.complete(&claim, file(1), &[]).await.unwrap(),
+                    Completion::Aborted
+                );
+            }
+            assert_eq!(store.snapshot(job).await.unwrap().state, JobState::Aborted);
+            assert!(store.claim(job, &worker).await.unwrap().is_none());
+
+            let job = store
+                .submit(&base.resolve("final").unwrap())
+                .await
+                .unwrap()
+                .job;
+            let claim = store.claim(job, &worker).await.unwrap().unwrap();
+            let (published, aborted) =
+                tokio::join!(store.complete(&claim, file(3), &[]), peer.abort(job));
+            match (published.unwrap(), aborted.unwrap()) {
+                (Completion::Published { done: true }, false) => {
+                    assert_eq!(store.stats(job).await.unwrap().total_word_count, 3);
+                    assert_eq!(store.snapshot(job).await.unwrap().state, JobState::Done);
+                }
+                (Completion::Aborted, true) => {
+                    assert_eq!(store.stats(job).await, Err(StoreError::JobAborted));
+                    let snapshot = store.snapshot(job).await.unwrap();
+                    assert_eq!((snapshot.processed, snapshot.successful_files), (0, 0));
+                    assert_eq!(snapshot.state, JobState::Aborted);
+                }
+                outcome => panic!("non-atomic abort/publication outcome: {outcome:?}"),
+            }
+        }
+        assert!(store.active_jobs().await.unwrap().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
 fn worker(index: usize) -> WorkerId {
     format!("test-worker-{index}").parse().unwrap()
 }

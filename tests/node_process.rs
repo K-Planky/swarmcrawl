@@ -23,6 +23,7 @@ use swarmcrawl::{
 use tokio::sync::Semaphore;
 
 struct NodeProcess {
+    _config_dir: tempfile::TempDir,
     child: Child,
     log: Arc<Mutex<String>>,
     reader: Option<thread::JoinHandle<()>>,
@@ -30,6 +31,7 @@ struct NodeProcess {
 
 impl NodeProcess {
     fn start(context: &Context, timeout: u64) -> Self {
+        let config_dir = tempfile::tempdir().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"))
             .args([
                 "node",
@@ -38,6 +40,7 @@ impl NodeProcess {
                 "--fetch-timeout-secs",
                 &timeout.to_string(),
             ])
+            .env("SWARMCRAWL_CONFIG_DIR", config_dir.path().join("absent"))
             .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
             // Retain only the Redis endpoint intentionally provided to this suite.
             .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
@@ -60,6 +63,7 @@ impl NodeProcess {
             }
         });
         Self {
+            _config_dir: config_dir,
             child,
             log,
             reader: Some(reader),
@@ -135,6 +139,7 @@ async fn done(store: &JobStore, job: JobId) -> WebStats {
             match snapshot.state {
                 JobState::Done => break store.stats(job).await.unwrap(),
                 JobState::Failed(reason) => panic!("job {job} unexpectedly failed: {reason:?}"),
+                JobState::Aborted => panic!("job {job} unexpectedly aborted"),
                 JobState::Running => assert!(snapshot.frontier + snapshot.in_flight > 0),
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

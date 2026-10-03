@@ -11,6 +11,7 @@ use std::{
 use super::support::Context;
 
 pub struct Process {
+    _config_dir: tempfile::TempDir,
     child: Child,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
@@ -44,9 +45,11 @@ impl Process {
     }
 
     pub fn with_env(context: &Context, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let config_dir = tempfile::tempdir().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"));
         command
             .args(args)
+            .env("SWARMCRAWL_CONFIG_DIR", config_dir.path().join("absent"))
             // Retain only this suite's explicitly supplied Redis endpoint.
             .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
             .env("SWARMCRAWL_JOB_NAMESPACE", &context.namespace)
@@ -61,6 +64,7 @@ impl Process {
         let (stdout, out_reader) = capture(child.stdout.take().unwrap());
         let (stderr, err_reader) = capture(child.stderr.take().unwrap());
         Self {
+            _config_dir: config_dir,
             child,
             stdout,
             stderr,

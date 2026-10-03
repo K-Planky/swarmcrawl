@@ -135,10 +135,15 @@ async fn crawl_owned(
         job: Some(job),
         error,
     })?;
-    if let Err(error) = fetched {
+    // Abort wins over a late HTTP success OR failure. It is user intent, not a
+    // node operational failure; keep serving unrelated and future jobs.
+    if let Err(error) = fetched
+        && completion != Completion::Aborted
+    {
         return Err(NodeError::Fetch { job, error });
     }
     match completion {
+        Completion::Aborted => Ok(()),
         Completion::Published { done } => {
             if done {
                 eprintln!("node {} job {job}: done", std::process::id());

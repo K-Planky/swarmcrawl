@@ -50,6 +50,8 @@ pub enum JobFailure {
 pub enum JobState {
     Running,
     Done,
+    /// Owner-requested terminal stop; partial totals are not final statistics.
+    Aborted,
     Failed(JobFailure),
 }
 
@@ -93,6 +95,19 @@ impl fmt::Debug for JobStore {
     }
 }
 
+/// Validate the shared namespace without making a connection.
+pub fn validate_namespace(namespace: &str) -> Result<(), StoreError> {
+    if namespace.is_empty()
+        || namespace.len() > 128
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return Err(StoreError::InvalidNamespace);
+    }
+    Ok(())
+}
+
 impl JobStore {
     pub async fn connect(config: &RedisConfig) -> Result<Self, StoreError> {
         Self::connect_in_namespace(config, DEFAULT_JOB_NAMESPACE).await
@@ -104,14 +119,7 @@ impl JobStore {
         config: &RedisConfig,
         namespace: &str,
     ) -> Result<Self, StoreError> {
-        if namespace.is_empty()
-            || namespace.len() > 128
-            || !namespace
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
-        {
-            return Err(StoreError::InvalidNamespace);
-        }
+        validate_namespace(namespace)?;
         let client = redis::Client::open(config.connection_info.clone())
             .map_err(|error| StoreError::redis("initialize client", error))?;
         let connection_config = AsyncConnectionConfig::new()
@@ -160,12 +168,39 @@ impl JobStore {
         }
     }
 
+    /// Snapshot of retained submission IDs, including terminal jobs. Reuse the
+    /// authoritative submission hash so older deployments need no index backfill.
+    /// States are read separately; this is not a cluster-wide progress snapshot.
+    pub async fn jobs(&self) -> Result<Vec<JobId>, StoreError> {
+        let values: Vec<String> = bounded(
+            self.timeout,
+            "list jobs",
+            redis::cmd("HVALS")
+                .arg(self.key("submissions"))
+                .query_async(&mut self.connection.clone()),
+        )
+        .await?;
+        let mut jobs = values
+            .iter()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| StoreError::InvalidData("submission job ID"))
+            })
+            .collect::<Result<Vec<JobId>, _>>()?;
+        jobs.sort_unstable();
+        if jobs.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StoreError::InvalidData("duplicate submission job ID"));
+        }
+        Ok(jobs)
+    }
+
     pub async fn snapshot(&self, job: JobId) -> Result<JobSnapshot, StoreError> {
         let (snapshot, _) = self.read(job).await?;
         Ok(snapshot)
     }
 
-    /// Never expose running/failed aggregates as final WebStats. The final-state
+    /// Never expose running/failed/aborted aggregates as final WebStats. The final-state
     /// and result reads share a single transaction; publication must be atomic too
     /// (the frontier protocol), not an out-of-band finalization step.
     pub async fn stats(&self, job: JobId) -> Result<WebStats, StoreError> {
@@ -173,6 +208,7 @@ impl JobStore {
         match snapshot.state {
             JobState::Running => Err(StoreError::NotFinished),
             JobState::Failed(reason) => Err(StoreError::JobFailed(reason)),
+            JobState::Aborted => Err(StoreError::JobAborted),
             JobState::Done => Ok(stats),
         }
     }
@@ -246,6 +282,7 @@ fn decode_snapshot(
     let state = match (field(&meta, "state")?, failure) {
         ("running", "") => JobState::Running,
         ("done", "") => JobState::Done,
+        ("aborted", "") => JobState::Aborted,
         ("failed", "fetch") => JobState::Failed(JobFailure::Fetch),
         ("failed", "statistics") => JobState::Failed(JobFailure::Statistics),
         ("failed", "protocol") => JobState::Failed(JobFailure::Protocol),
@@ -329,6 +366,7 @@ pub enum StoreError {
     UnknownJob,
     NotFinished,
     JobFailed(JobFailure),
+    JobAborted,
     SequenceExhausted,
     WorkerSequenceExhausted,
     InvalidData(&'static str),
@@ -360,6 +398,7 @@ impl fmt::Display for StoreError {
             Self::UnknownJob => f.write_str("unknown job; verify its ID, Redis database and namespace"),
             Self::NotFinished => f.write_str("job is still running; final statistics are not available"),
             Self::JobFailed(reason) => write!(f, "job failed ({reason:?}); final statistics are not available"),
+            Self::JobAborted => f.write_str("job was aborted; final statistics are not available"),
             Self::SequenceExhausted => f.write_str("job ID sequence is exhausted; select a new namespace for new jobs"),
             Self::WorkerSequenceExhausted => f.write_str("worker identity sequence is exhausted; select a new namespace for new jobs and nodes"),
             Self::InvalidData(field) => write!(f, "invalid Redis job data ({field}); verify the schema and exclusive namespace use"),
@@ -380,6 +419,36 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
+    }
+
+    #[test]
+    fn aborted_snapshots_preserve_progress_invariants_and_require_no_failure_reason() {
+        let id = "1".parse().unwrap();
+        let mut meta = fields(&[
+            ("schema", "1"),
+            ("base", "https://example.org/"),
+            ("state", "aborted"),
+            ("processed", "1"),
+            ("failure", ""),
+        ]);
+        let totals = fields(&[
+            ("num_files", "1"),
+            ("num_exts", "1"),
+            ("total_word_count", "2"),
+        ]);
+        let exts = fields(&[("html", "1")]);
+        let (snapshot, _) =
+            decode_snapshot(id, (meta.clone(), 4, 2, 1, totals.clone(), exts.clone())).unwrap();
+        assert_eq!(snapshot.state, JobState::Aborted);
+        assert_eq!(
+            (snapshot.processed, snapshot.frontier, snapshot.in_flight),
+            (1, 2, 1)
+        );
+        assert!(
+            decode_snapshot(id, (meta.clone(), 3, 2, 1, totals.clone(), exts.clone())).is_err()
+        );
+        meta.insert("failure".into(), "fetch".into());
+        assert!(decode_snapshot(id, (meta, 4, 2, 1, totals, exts)).is_err());
     }
 
     #[test]

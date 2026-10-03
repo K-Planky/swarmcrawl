@@ -59,6 +59,58 @@ pub async fn submit(store: &JobStore, bases: &[CrawlUrl]) -> Result<(), CommandE
     Ok(())
 }
 
+/// Enumerate all retained jobs, ordered by numeric ID. Each row is coherent but
+/// rows can reflect different instants; do not claim a global snapshot.
+pub async fn jobs(store: &JobStore) -> Result<(), CommandError> {
+    let jobs = store.jobs().await.map_err(CommandError::List)?;
+    let mut output = io::stdout().lock();
+    if jobs.is_empty() {
+        writeln!(output, "No jobs in this database/namespace.")
+            .map_err(|_| CommandError::Output)?;
+    }
+    for job in jobs {
+        let snapshot = store
+            .snapshot(job)
+            .await
+            .map_err(|error| CommandError::Job { job, error })?;
+        write_snapshot(&mut output, &snapshot).map_err(|_| CommandError::Output)?;
+        output.flush().map_err(|_| CommandError::Output)?;
+    }
+    Ok(())
+}
+
+/// --all captures the active set once; each per-job abort is atomic. A later
+/// error leaves earlier aborts in effect, just as a multi-input submission does.
+pub async fn abort(store: &JobStore, job: Option<JobId>) -> Result<(), CommandError> {
+    let jobs = match job {
+        Some(job) => vec![job],
+        None => store.active_jobs().await.map_err(CommandError::List)?,
+    };
+    let mut output = io::stdout().lock();
+    if jobs.is_empty() {
+        writeln!(output, "No running jobs in this database/namespace.")
+            .map_err(|_| CommandError::Output)?;
+    }
+    for job in jobs {
+        let changed = store
+            .abort(job)
+            .await
+            .map_err(|error| CommandError::Abort { job, error })?;
+        writeln!(
+            output,
+            "job {job}  {}",
+            if changed {
+                "aborted"
+            } else {
+                "unchanged (already terminal)"
+            }
+        )
+        .and_then(|()| output.flush())
+        .map_err(|_| CommandError::Output)?;
+    }
+    Ok(())
+}
+
 pub async fn status(store: &JobStore, job: JobId, follow: bool) -> Result<(), CommandError> {
     if !follow {
         return watch_status(store, job, false).await;
@@ -89,6 +141,12 @@ async fn watch_status(store: &JobStore, job: JobId, follow: bool) -> Result<(), 
         }
         match snapshot.state {
             JobState::Done => return Ok(()),
+            JobState::Aborted => {
+                return Err(CommandError::Job {
+                    job,
+                    error: StoreError::JobAborted,
+                });
+            }
             JobState::Failed(reason) => {
                 return Err(CommandError::Job {
                     job,
@@ -129,6 +187,7 @@ fn write_snapshot(output: &mut impl Write, snapshot: &JobSnapshot) -> io::Result
     match snapshot.state {
         JobState::Running => writeln!(output, "running"),
         JobState::Done => writeln!(output, "done"),
+        JobState::Aborted => writeln!(output, "aborted"),
         JobState::Failed(reason) => writeln!(
             output,
             "failed ({})",
@@ -160,6 +219,8 @@ pub enum CommandError {
     InvalidUrl { input: usize, error: UrlError },
     Submit { input: usize, error: StoreError },
     Job { job: JobId, error: StoreError },
+    Abort { job: JobId, error: StoreError },
+    List(StoreError),
     Output,
     Signal,
     Interrupted,
@@ -171,7 +232,9 @@ impl fmt::Display for CommandError {
             Self::InvalidUrl { input, error } => write!(f, "submit input {input}: {error}; no URLs submitted"),
             Self::Submit { input, error } => write!(f, "submit input {input}: {error}; earlier printed IDs remain valid; resubmit to retrieve retained IDs (this write may have taken effect)"),
             Self::Job { job, error } => write!(f, "job {job}: {error}"),
-            Self::Output => f.write_str("cannot write CLI output; any submissions may have taken effect; resubmit to retrieve retained IDs"),
+            Self::Abort { job, error } => write!(f, "abort job {job}: {error}; earlier aborts remain in effect and this write may have taken effect; inspect status before retrying"),
+            Self::List(error) => write!(f, "list jobs: {error}"),
+            Self::Output => f.write_str("cannot write CLI output; any submissions or aborts may have taken effect; inspect jobs/status before retrying"),
             Self::Signal => f.write_str("cannot wait for Ctrl-C; check host/runtime signal support"),
             Self::Interrupted => f.write_str("status follow interrupted; the job continues unchanged"),
         }
