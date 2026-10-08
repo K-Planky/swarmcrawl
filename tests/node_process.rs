@@ -186,6 +186,146 @@ fn assert_unique(fixture: &HttpFixture, count: usize) {
 
 #[tokio::test]
 #[ignore = "requires Unix signals and real Redis; run scripts/redis-smoke.sh"]
+async fn a_real_node_reuses_connections_and_waits_for_full_bodies_before_final_stats() {
+    with_redis(|context| async move {
+        for close in [false, true] {
+            let gate = Arc::new(Semaphore::new(0));
+            let mut routes = Vec::new();
+            for i in 0..12 {
+                let path = if i == 0 {
+                    "/chain/".into()
+                } else {
+                    format!("/chain/p{i}")
+                };
+                let mut reply = if i == 11 {
+                    html("Page words", []).gated_body("<a href='late'></a>", &gate)
+                } else {
+                    html(
+                        "Page words",
+                        [format!("p{}", i + 1), format!("p{}#duplicate", i + 1)],
+                    )
+                };
+                if close {
+                    reply = reply.header("Connection", "close");
+                }
+                routes.push((path, reply));
+            }
+            let mut late = html("Late words", []);
+            if close {
+                late = late.header("Connection", "close");
+            }
+            routes.push(("/chain/late".into(), late));
+            let fixture = HttpFixture::start(routes).await;
+            let store = context.store().await;
+            let job = store.submit(&fixture.url("/chain/")).await.unwrap().job;
+            let mut node = NodeProcess::start(&context, 5);
+            fixture.wait_for_headers(12).await;
+            let progress = store.snapshot(job).await.unwrap();
+            assert_eq!(progress.state, JobState::Running);
+            assert_eq!(
+                (progress.processed, progress.frontier, progress.in_flight),
+                (11, 0, 1)
+            );
+            assert_eq!(store.stats(job).await, Err(StoreError::NotFinished));
+            assert_eq!(fixture.connections(), if close { 12 } else { 1 });
+            gate.add_permits(1);
+            assert_eq!(done(&store, job).await, expected_html(13, 26));
+            assert_eq!(fixture.connections(), if close { 13 } else { 1 });
+            node.stop().await;
+            http::wait_until(|| fixture.closed_connections() == fixture.connections()).await;
+            assert_unique(&fixture, 13);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Unix signals and real Redis; run scripts/redis-smoke.sh"]
+async fn pooled_connection_faults_fail_jobs_without_replaying_gets_or_publishing_partial_html() {
+    with_redis(|context| async move {
+        for fault in ["no-headers", "truncated", "chunked", "status"] {
+            let gate = Arc::new(Semaphore::new(0));
+            let partial = "<p>Partial words</p><a href='never'>Never</a>";
+            let mut broken = match fault {
+                "no-headers" => Reply::new(0, "text/html", "").gated_headers(&gate),
+                "truncated" => Reply::new(200, "text/html", partial)
+                    .header("Content-Length", "10000")
+                    .gated_body("", &gate),
+                "chunked" => Reply::new(
+                    200,
+                    "text/html",
+                    format!("{:x}\r\n{partial}\r\n", partial.len()),
+                )
+                .header("Transfer-Encoding", "chunked")
+                .gated_body("", &gate),
+                "status" => Reply::new(503, "text/html", partial).gated_headers(&gate),
+                _ => unreachable!(),
+            };
+            broken.close_after_body = true;
+            let fixture = HttpFixture::start([
+                (
+                    "/fault/".into(),
+                    html("Seed words", ["warm".into(), "warm#duplicate".into()]),
+                ),
+                (
+                    "/fault/warm".into(),
+                    html("Warm words", ["broken".into(), "broken#duplicate".into()]),
+                ),
+                ("/fault/broken".into(), broken),
+                ("/fault/never".into(), html("Must not fetch", [])),
+            ])
+            .await;
+            let store = context.store().await;
+            let job = store.submit(&fixture.url("/fault/")).await.unwrap().job;
+            let mut node = NodeProcess::start(&context, 5);
+            fixture.wait_for_requests(3).await;
+            if matches!(fault, "truncated" | "chunked") {
+                fixture.wait_for_headers(3).await;
+            }
+            assert_eq!(
+                fixture.connections(),
+                1,
+                "fault on reused TCP socket: {fault}"
+            );
+            assert_eq!(store.stats(job).await, Err(StoreError::NotFinished));
+            gate.add_permits(1);
+            assert_eq!(node.exit().await.code(), Some(1), "{}", node.log());
+            let frozen = store.snapshot(job).await.unwrap();
+            assert_eq!(frozen.state, JobState::Failed(JobFailure::Fetch));
+            assert_eq!(
+                (frozen.processed, frozen.successful_files, frozen.discovered),
+                (2, 2, 3)
+            );
+            assert_eq!(
+                store.stats(job).await,
+                Err(StoreError::JobFailed(JobFailure::Fetch))
+            );
+            assert_eq!(
+                fixture.connections(),
+                1,
+                "no started-request reconnect: {fault}"
+            );
+            http::wait_until(|| fixture.closed_connections() == 1).await;
+            assert_unique(&fixture, 3);
+            // Failure and submission identity survive another actual worker.
+            let mut replacement = NodeProcess::start(&context, 5);
+            replacement.wait_log("ready; polling").await;
+            assert_eq!(
+                store.submit(&fixture.url("/fault/")).await.unwrap().job,
+                job
+            );
+            replacement.stop().await;
+            assert_eq!(store.snapshot(job).await.unwrap(), frozen);
+            assert_unique(&fixture, 3);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Unix signals and real Redis; run scripts/redis-smoke.sh"]
 async fn single_node_consumes_jobs_before_and_after_startup_and_handles_absence() {
     with_redis(|context| async move {
         let fixture = HttpFixture::start([

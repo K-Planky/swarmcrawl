@@ -1,6 +1,6 @@
 //! One owned URL → one GET → an outcome ready for atomic Redis publication.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use encoding_rs::{Encoding, UTF_8};
 use reqwest::{Client, StatusCode, header};
@@ -48,9 +48,13 @@ impl Fetcher {
             .retry(reqwest::retry::never())
             .no_proxy()
             .referer(false)
-            // Do not reuse stale HTTP/1 connections through a lower-level
-            // transparent canceled-request retry. TLS/client state is shared.
-            .pool_max_idle_per_host(0)
+            // retry::never() disables reqwest's outer retries, not hyper-util's
+            // stale-connection recovery. Audited reqwest 0.13.5 / hyper-util 0.1.21
+            // / hyper 1.11.1 return a request for recovery only BEFORE HTTP/1
+            // dispatch dequeues it (before serialization or any request bytes).
+            // Started requests are never replayed. Re-audit on transport upgrades.
+            .pool_max_idle_per_host(MAX_NODE_REQUESTS)
+            .pool_idle_timeout(Duration::from_secs(30))
             .http1_only()
             .gzip(true)
             .no_brotli()

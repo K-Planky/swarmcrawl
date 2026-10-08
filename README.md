@@ -140,7 +140,9 @@ Final `WebStats` are readable as soon as a job is done and have no expiry. Dedup
 
 ## Limits and failures
 
-There are no automatic HTTP retries. Timeouts, transport/decoding errors, 408/429, 5xx, and unsupported response statuses fail the job rather than produce partial final results. A node encountering an operational error stops claiming, drains owned work, and exits nonzero; inspect its diagnostics and restart it to serve other jobs.
+Each node reuses HTTP/1.1 connections, with up to ten idle connections per host and a 30-second idle timeout. The ten-request limit includes response-body transfer.
+
+There are no application-level retries. Stale connections may be replaced only before a request is dispatched; started requests are never retried. Timeouts, transport/decoding errors, 408/429, 5xx, and unsupported response statuses fail the job rather than produce partial final results. A node encountering an operational error stops claiming, drains owned work, and exits nonzero; inspect its diagnostics and restart it to serve other jobs.
 
 Crash recovery is not implemented: killing a node or losing Redis can strand work. Graceful shutdown is not crash recovery. There is no JavaScript rendering, `robots.txt` handling, politeness delay, or page/HTML-body size limit. Use a narrow base on trusted targets; the per-node request cap is not a site-wide rate limit.
 

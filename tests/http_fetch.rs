@@ -37,6 +37,248 @@ fn fetcher() -> Fetcher {
 }
 
 #[tokio::test]
+async fn sequential_distinct_urls_share_a_tcp_connection_unless_server_says_close() {
+    bounded(async {
+        for close in [false, true] {
+            let paths: Vec<_> = (0..12).map(|i| format!("/docs/page-{i}")).collect();
+            let fixture = HttpFixture::start(paths.iter().map(|path| {
+                let reply = Reply::new(200, "text/html", "Whole body");
+                (
+                    path.clone(),
+                    if close {
+                        reply.header("Connection", "close")
+                    } else {
+                        reply
+                    },
+                )
+            }))
+            .await;
+            let fetcher = fetcher();
+            for path in &paths {
+                assert_eq!(
+                    fetcher
+                        .fetch(&fixture.scope("/docs/"), &fixture.url(path))
+                        .await
+                        .unwrap()
+                        .result,
+                    PageResult::File { html_word_count: 2 }
+                );
+            }
+            let expected_connections = if close { paths.len() } else { 1 };
+            assert_eq!(fixture.connections(), expected_connections);
+            let requests = fixture.requests();
+            assert_eq!(
+                requests.iter().map(|r| &r.target).collect::<Vec<_>>(),
+                paths.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|r| r.connection)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                expected_connections
+            );
+            // Dropping the shared client releases idle sockets as well as requests.
+            drop(fetcher);
+            http::wait_until(|| fixture.closed_connections() == expected_connections).await;
+            fixture.assert_healthy();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_gated_stale_idle_connection_is_replaced_without_duplicate_gets() {
+    bounded(async {
+        let close = Arc::new(Semaphore::new(0));
+        let mut warm = Reply::new(200, "text/html", "Warm body");
+        warm.idle_close_gate = Some(close.clone());
+        let fixture = HttpFixture::start([
+            ("/docs/warm".into(), warm.clone()),
+            ("/docs/warm-again".into(), warm),
+            (
+                "/docs/next".into(),
+                Reply::new(200, "text/html", "Next body"),
+            ),
+        ])
+        .await;
+        let fetcher = fetcher();
+        let scope = fixture.scope("/docs/");
+        for path in ["/docs/warm", "/docs/warm-again"] {
+            fetcher.fetch(&scope, &fixture.url(path)).await.unwrap();
+        }
+        assert_eq!(
+            fixture.connections(),
+            1,
+            "prove the socket was reusable before closing it"
+        );
+        fixture.wait_for_completed(2).await;
+        close.add_permits(1);
+        http::wait_until(|| fixture.closed_connections() == 1).await;
+        assert_eq!(
+            fetcher
+                .fetch(&scope, &fixture.url("/docs/next"))
+                .await
+                .unwrap()
+                .result,
+            PageResult::File { html_word_count: 2 }
+        );
+        assert_eq!(fixture.connections(), 2);
+        let requests = fixture.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.target.as_str())
+                .collect::<Vec<_>>(),
+            ["/docs/warm", "/docs/warm-again", "/docs/next"]
+        );
+        assert_eq!(
+            requests.iter().map(|r| r.connection).collect::<Vec<_>>(),
+            [1, 1, 2]
+        );
+        drop(fetcher);
+        http::wait_until(|| fixture.closed_connections() == 2).await;
+        fixture.assert_healthy();
+        // This observes a server-closed idle socket. Whether hyper notices the
+        // close before checkout or recovers an unstarted request is private;
+        // safety of that exact boundary is established by the pinned-source audit.
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn silent_server_closure_after_a_complete_response_does_not_replay_it() {
+    bounded(async {
+        let mut reply = Reply::new(200, "text/html", "Complete body");
+        reply.close_after_body = true; // No Connection: close notification.
+        let fixture = HttpFixture::start([
+            ("/docs/first".into(), reply),
+            (
+                "/docs/second".into(),
+                Reply::new(200, "text/html", "Second body"),
+            ),
+        ])
+        .await;
+        let fetcher = fetcher();
+        for path in ["/docs/first", "/docs/second"] {
+            assert_eq!(
+                fetcher
+                    .fetch(&fixture.scope("/docs/"), &fixture.url(path))
+                    .await
+                    .unwrap()
+                    .result,
+                PageResult::File { html_word_count: 2 }
+            );
+        }
+        assert_eq!(fixture.connections(), 2);
+        assert_eq!(fixture.requests().len(), 2);
+        assert_eq!(fixture.requests()[0].connection, 1);
+        assert_eq!(fixture.requests()[1].connection, 2);
+        drop(fetcher);
+        http::wait_until(|| fixture.closed_connections() == 2).await;
+        fixture.assert_healthy();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn started_gets_on_reused_connections_are_not_replayed_on_header_body_or_status_faults() {
+    bounded(async {
+        let partial = "<p>Partial words</p><a href='never'>Never</a>";
+        for fault in ["no-headers", "truncated", "chunked", "status"] {
+            let gate = Arc::new(Semaphore::new(0));
+            let (mut broken, expected) = match fault {
+                "no-headers" => (
+                    Reply::new(0, "text/html", "").gated_headers(&gate),
+                    FetchError::Transport,
+                ),
+                "truncated" => (
+                    Reply::new(200, "text/html", partial)
+                        .header("Content-Length", "10000")
+                        .gated_body("", &gate),
+                    FetchError::Body,
+                ),
+                "chunked" => (
+                    Reply::new(
+                        200,
+                        "text/html",
+                        format!("{:x}\r\n{partial}\r\n", partial.len()),
+                    )
+                    .header("Transfer-Encoding", "chunked")
+                    .gated_body("", &gate),
+                    FetchError::Body,
+                ),
+                "status" => (
+                    Reply::new(503, "text/html", partial).gated_headers(&gate),
+                    FetchError::UnexpectedStatus(503),
+                ),
+                _ => unreachable!(),
+            };
+            broken.close_after_body = true;
+            let fixture = HttpFixture::start([
+                (
+                    "/docs/warm".into(),
+                    Reply::new(200, "text/html", "Warm body"),
+                ),
+                ("/docs/broken".into(), broken),
+            ])
+            .await;
+            let fetcher = fetcher();
+            fetcher
+                .fetch(&fixture.scope("/docs/"), &fixture.url("/docs/warm"))
+                .await
+                .unwrap();
+            let clone = fetcher.clone();
+            let scope = fixture.scope("/docs/");
+            let url = fixture.url("/docs/broken");
+            // JoinSet also cancels this owned future if the test fails or times out.
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move { clone.fetch(&scope, &url).await });
+            fixture.wait_for_requests(2).await;
+            if matches!(fault, "truncated" | "chunked") {
+                fixture.wait_for_headers(2).await;
+            }
+            assert!(
+                tasks.try_join_next().is_none(),
+                "fault gate must hold the fetch: {fault}"
+            );
+            assert_eq!(
+                fixture.connections(),
+                1,
+                "fault must occur on a reused socket: {fault}"
+            );
+            gate.add_permits(1);
+            assert_eq!(
+                tasks.join_next().await.unwrap().unwrap(),
+                Err(expected),
+                "{fault}"
+            );
+            // No successful outcome or discoveries, even though the HTML prefix
+            // alone contains countable words and an in-scope link.
+            drop(fetcher);
+            http::wait_until(|| fixture.closed_connections() == fixture.connections()).await;
+            assert_eq!(
+                fixture.connections(),
+                1,
+                "no reconnect/replay of a started GET: {fault}"
+            );
+            assert_eq!(
+                fixture
+                    .requests()
+                    .iter()
+                    .map(|r| r.target.as_str())
+                    .collect::<Vec<_>>(),
+                ["/docs/warm", "/docs/broken"],
+                "{fault}"
+            );
+            fixture.assert_healthy();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn mime_not_suffix_controls_full_document_extraction_and_file_results() {
     bounded(async {
         let source = format!(
@@ -474,7 +716,9 @@ async fn deadlines_transfer_failures_and_disconnects_are_not_broken_links_or_ret
             ),
             (
                 "/docs/truncated".into(),
-                Reply::new(200, "text/html", "short").header("Content-Length", "100"),
+                Reply::new(200, "text/html", "short")
+                    .header("Content-Length", "100")
+                    .header("Connection", "close"),
             ),
             (
                 "/docs/disconnect?token=fixture-query".into(),
