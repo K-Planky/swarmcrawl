@@ -8,12 +8,16 @@ use tokio::sync::Semaphore;
 
 use crate::{
     config::FetchConfig,
+    diagnostics::{Activity, Diagnostics, Stage, Timer},
     html::{HtmlError, is_html_content_type, parse_html},
     jobs::PageResult,
     urls::{CrawlScope, CrawlUrl},
 };
 
 pub const MAX_NODE_REQUESTS: usize = 10;
+/// Acquire before spawning: bound both running and Tokio-queued CPU closures.
+/// The node's owned-task cap separately bounds bodies waiting for this budget.
+pub const MAX_NODE_CPU_WORK: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchOutcome {
@@ -29,19 +33,51 @@ pub struct FetchOutcome {
 pub struct Fetcher {
     client: Client,
     budget: Arc<Semaphore>,
+    diagnostics: Diagnostics,
+    cpu_budget: Arc<Semaphore>,
+    #[cfg(test)]
+    cpu_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    publication_gate: Option<Arc<Semaphore>>,
 }
 
 impl fmt::Debug for Fetcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Fetcher")
             .field("max_requests", &MAX_NODE_REQUESTS)
+            .field("max_cpu_work", &MAX_NODE_CPU_WORK)
             .finish_non_exhaustive()
     }
 }
 
 impl Fetcher {
     pub fn new(config: FetchConfig) -> Result<Self, FetchError> {
-        let client = Client::builder()
+        Self::build(config, None)
+    }
+
+    /// Explicit additional trust for an isolated HTTPS fixture runner. The normal
+    /// CLI never calls this; certificate and hostname verification remain enabled.
+    pub fn with_root_certificate(
+        config: FetchConfig,
+        certificate: reqwest::Certificate,
+    ) -> Result<Self, FetchError> {
+        Self::build(config, Some(certificate))
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub(crate) fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+
+    fn build(
+        config: FetchConfig,
+        certificate: Option<reqwest::Certificate>,
+    ) -> Result<Self, FetchError> {
+        let mut builder = Client::builder()
             .timeout(config.timeout)
             .connect_timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -60,12 +96,20 @@ impl Fetcher {
             .no_brotli()
             .no_deflate()
             .no_zstd()
-            .user_agent(concat!("swarmcrawl/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| FetchError::ClientSetup)?;
+            .user_agent(concat!("swarmcrawl/", env!("CARGO_PKG_VERSION")));
+        if let Some(certificate) = certificate {
+            builder = builder.tls_certs_merge([certificate]);
+        }
+        let client = builder.build().map_err(|_| FetchError::ClientSetup)?;
         Ok(Self {
             client,
             budget: Arc::new(Semaphore::new(MAX_NODE_REQUESTS)),
+            diagnostics: Diagnostics::default(),
+            cpu_budget: Arc::new(Semaphore::new(MAX_NODE_CPU_WORK)),
+            #[cfg(test)]
+            cpu_hook: None,
+            #[cfg(test)]
+            publication_gate: None,
         })
     }
 
@@ -76,6 +120,16 @@ impl Fetcher {
         scope: &CrawlScope,
         url: &CrawlUrl,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_owned(scope, url, self.diagnostics.timer(Stage::HttpAdmission))
+            .await
+    }
+
+    pub(crate) async fn fetch_owned(
+        &self,
+        scope: &CrawlScope,
+        url: &CrawlUrl,
+        admission: Timer,
+    ) -> Result<FetchOutcome, FetchError> {
         if !scope.contains(url) {
             return Err(FetchError::OutsideScope);
         }
@@ -84,6 +138,9 @@ impl Fetcher {
             .acquire()
             .await
             .map_err(|_| FetchError::BudgetClosed)?;
+        drop(admission);
+        let transfer = self.diagnostics.timer(Stage::HttpTransfer);
+        let active_http = self.diagnostics.enter(Activity::Http);
         let response = self
             .client
             .get(url.as_str())
@@ -169,18 +226,80 @@ impl Fetcher {
             .await
             .map_err(|error| network_error(&error, FetchError::Body))?;
         // Full network body is now consumed/dropped; CPU parsing needs no permit.
+        drop(active_http);
+        drop(transfer);
         drop(permit);
-        let (source, _, malformed) = encoding.decode(&bytes);
-        if malformed {
-            return Err(FetchError::InvalidTextEncoding);
-        }
-        let parsed = parse_html(scope, url, &source).map_err(FetchError::Html)?;
-        Ok(FetchOutcome {
-            result: PageResult::File {
-                html_word_count: parsed.word_count,
-            },
-            discoveries: parsed.links,
+        let scope = scope.clone();
+        let url = url.clone();
+        let diagnostics = self.diagnostics.clone();
+        #[cfg(test)]
+        let hook = self.cpu_hook.clone();
+        self.cpu_work(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            let decode = diagnostics.timer(Stage::Decode);
+            let (source, _, malformed) = encoding.decode(&bytes);
+            drop(decode);
+            if malformed {
+                return Err(FetchError::InvalidTextEncoding);
+            }
+            let parse = diagnostics.timer(Stage::Parse);
+            let parsed = parse_html(&scope, &url, &source).map_err(FetchError::Html)?;
+            drop(parse);
+            Ok(FetchOutcome {
+                result: PageResult::File {
+                    html_word_count: parsed.word_count,
+                },
+                discoveries: parsed.links,
+            })
         })
+        .await?
+    }
+
+    async fn cpu_work<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, FetchError> {
+        let admission = self.diagnostics.timer(Stage::CpuAdmission);
+        let permit = self
+            .cpu_budget
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| FetchError::CpuBudgetClosed)?;
+        let diagnostics = self.diagnostics.clone();
+        tokio::task::spawn_blocking(move || {
+            // Includes Tokio blocking-pool waiting in admission, not parse time.
+            drop(admission);
+            // Keep the permit IN the closure: dropping a fetch future cannot
+            // free a CPU slot while its non-abortable blocking work still runs.
+            let _permit = permit;
+            let _active = diagnostics.enter(Activity::Cpu);
+            work()
+        })
+        .await
+        .map_err(|_| FetchError::CpuTaskFailed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_publication_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.publication_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_publication_gate(&self) {
+        if let Some(gate) = &self.publication_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cpu_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.cpu_hook = Some(hook);
+        self
     }
 }
 
@@ -198,6 +317,8 @@ fn network_error(error: &reqwest::Error, fallback: FetchError) -> FetchError {
 pub enum FetchError {
     ClientSetup,
     BudgetClosed,
+    CpuBudgetClosed,
+    CpuTaskFailed,
     OutsideScope,
     Timeout,
     Transport,
@@ -218,6 +339,10 @@ impl fmt::Display for FetchError {
                 f.write_str("cannot initialize HTTP client; check TLS/runtime setup")
             }
             Self::BudgetClosed => f.write_str("HTTP request budget unexpectedly closed"),
+            Self::CpuBudgetClosed => f.write_str("HTML CPU budget unexpectedly closed"),
+            Self::CpuTaskFailed => f.write_str(
+                "HTML CPU task panicked or was canceled; crawl is incomplete (no retry)",
+            ),
             Self::OutsideScope => f.write_str("refusing to fetch URL outside its job scope"),
             Self::Timeout => {
                 f.write_str("HTTP request deadline exceeded; crawl is incomplete (no retry)")
@@ -255,6 +380,88 @@ impl Error for FetchError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_waiters_do_not_release_running_or_queued_cpu_permits_and_failures_are_explicit() {
+        // Force three admitted closures to queue behind one running closure.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use std::sync::{
+                Condvar, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let fetcher = Fetcher::new(FetchConfig::default()).unwrap();
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            struct Release(Arc<(Mutex<bool>, Condvar)>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    *self.0.0.lock().unwrap() = true;
+                    self.0.1.notify_all();
+                }
+            }
+            let release = Release(gate.clone());
+            let started = Arc::new(AtomicUsize::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..2 * MAX_NODE_CPU_WORK {
+                let fetcher = fetcher.clone();
+                let gate = gate.clone();
+                let started = started.clone();
+                tasks.spawn(async move {
+                    fetcher
+                        .cpu_work(move || {
+                            let mut released = gate.0.lock().unwrap();
+                            started.fetch_add(1, Ordering::SeqCst);
+                            while !*released {
+                                let (next, expired) = gate
+                                    .1
+                                    .wait_timeout(released, Duration::from_secs(10))
+                                    .unwrap();
+                                released = next;
+                                if expired.timed_out() && !*released {
+                                    drop(released);
+                                    panic!("CPU test gate exceeded its safety deadline");
+                                }
+                            }
+                        })
+                        .await
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fetcher.cpu_budget.available_permits() != 0
+                    || started.load(Ordering::SeqCst) != 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            assert_eq!(fetcher.cpu_budget.available_permits(), 0);
+            drop(release);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fetcher.cpu_budget.available_permits() != MAX_NODE_CPU_WORK {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(started.load(Ordering::SeqCst), MAX_NODE_CPU_WORK);
+            let failed = fetcher.cpu_work(|| panic!("test CPU panic")).await;
+            assert_eq!(failed, Err::<(), _>(FetchError::CpuTaskFailed));
+            assert_eq!(fetcher.cpu_budget.available_permits(), MAX_NODE_CPU_WORK);
+            fetcher.cpu_budget.close();
+            assert_eq!(
+                fetcher.cpu_work(|| ()).await,
+                Err(FetchError::CpuBudgetClosed)
+            );
+        });
+    }
 
     #[test]
     fn interface_is_send_and_diagnostics_have_no_url_details() {

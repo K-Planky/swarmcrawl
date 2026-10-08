@@ -18,6 +18,7 @@ use http::{HttpFixture, Reply};
 use support::{Context, with_redis};
 use swarmcrawl::{
     jobs::{JobFailure, JobId, JobState, JobStore, StoreError},
+    node::MAX_NODE_OWNED_TASKS,
     stats::WebStats,
 };
 use tokio::sync::Semaphore;
@@ -31,6 +32,10 @@ struct NodeProcess {
 
 impl NodeProcess {
     fn start(context: &Context, timeout: u64) -> Self {
+        Self::configured(context, timeout, false)
+    }
+
+    fn configured(context: &Context, timeout: u64, diagnostics: bool) -> Self {
         let config_dir = tempfile::tempdir().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_swarmcrawl"))
             .args([
@@ -42,6 +47,10 @@ impl NodeProcess {
             ])
             .env("SWARMCRAWL_CONFIG_DIR", config_dir.path().join("absent"))
             .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
+            .env(
+                "SWARMCRAWL_DIAGNOSTICS",
+                if diagnostics { "true" } else { "false" },
+            )
             // Retain only the Redis endpoint intentionally provided to this suite.
             .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
             .env_remove("SWARMCRAWL_JOB_NAMESPACE")
@@ -182,6 +191,62 @@ fn assert_unique(fixture: &HttpFixture, count: usize) {
         "duplicate GET: {counts:?}"
     );
     fixture.assert_healthy();
+}
+
+#[tokio::test]
+#[ignore = "requires Unix signals and real Redis; run scripts/redis-smoke.sh"]
+async fn diagnostics_are_opt_in_aggregates_and_do_not_change_stats_or_expose_payloads() {
+    with_redis(|context| async move {
+        for enabled in [false, true] {
+            let fixture = HttpFixture::start([(
+                "/secret/?token=fixture-sensitive-query".into(),
+                Reply::new(
+                    200,
+                    "text/html",
+                    "<p>Private words</p><!-- fixture-sensitive-html -->",
+                )
+                .header("X-Fixture", "fixture-sensitive-header"),
+            )])
+            .await;
+            let store = context.store().await;
+            let job = store
+                .submit(&fixture.url("/secret/?token=fixture-sensitive-query"))
+                .await
+                .unwrap()
+                .job;
+            let mut node = NodeProcess::configured(&context, 5, enabled);
+            assert_eq!(done(&store, job).await, expected_html(1, 2));
+            node.stop().await;
+            let log = node.log();
+            assert!(!log.contains("fixture-sensitive") && !log.contains("http://"));
+            let reports: Vec<_> = log
+                .lines()
+                .filter_map(|line| line.strip_prefix("swarmcrawl_metrics "))
+                .collect();
+            assert_eq!(reports.len(), usize::from(enabled));
+            if enabled {
+                let metrics: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
+                for stage in [
+                    "http_admission",
+                    "http_transfer",
+                    "cpu_admission",
+                    "decode",
+                    "parse",
+                    "publication",
+                ] {
+                    assert_eq!(metrics[stage]["count"], 1);
+                }
+                for gauge in ["http", "cpu", "owned"] {
+                    assert_eq!(metrics[gauge]["active"], 0);
+                    assert_eq!(metrics[gauge]["peak"], 1);
+                }
+                assert_eq!(metrics.as_object().unwrap().len(), 10);
+            }
+            assert_unique(&fixture, 1);
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -415,12 +480,36 @@ async fn one_node_shares_ten_concurrent_requests_across_jobs() {
         let b = store.submit(&fixture.url("/b/")).await.unwrap().job;
         let mut node = NodeProcess::start(&context, 5);
         fixture.wait_for_headers(12).await; // Both seeds + ten bodies held open.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let owned = store.snapshot(a).await.unwrap().in_flight
+                    + store.snapshot(b).await.unwrap().in_flight;
+                if owned == MAX_NODE_OWNED_TASKS as u64 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let a_progress = store.snapshot(a).await.unwrap();
         let b_progress = store.snapshot(b).await.unwrap();
-        assert_eq!(a_progress.in_flight + b_progress.in_flight, 10);
+        assert_eq!(
+            a_progress.in_flight + b_progress.in_flight,
+            MAX_NODE_OWNED_TASKS as u64
+        );
         assert!(a_progress.in_flight > 0 && b_progress.in_flight > 0);
-        assert_eq!(a_progress.frontier + b_progress.frontier, 18);
+        assert_eq!(a_progress.frontier + b_progress.frontier, 8);
         assert_eq!(fixture.requests().len(), 12);
+        for base in ["a", "b"] {
+            assert!(
+                fixture
+                    .requests()
+                    .iter()
+                    .any(|request| request.target.starts_with(&format!("/{base}/p"))),
+                "both jobs receive actual HTTP service"
+            );
+        }
         assert_eq!(fixture.peak(), 10);
         assert_eq!(store.stats(a).await, Err(StoreError::NotFinished));
         gate.add_permits(28);
@@ -441,9 +530,9 @@ async fn two_independent_nodes_own_a_convergent_graph_and_wait_for_delayed_disco
         let gate = Arc::new(Semaphore::new(0));
         let mut routes = vec![(
             "/graph/".into(),
-            html("Seed words", (0..20).map(|i| format!("p{i}"))),
+            html("Seed words", (0..40).map(|i| format!("p{i}"))),
         )];
-        for i in 0..20 {
+        for i in 0..40 {
             let tail = if i == 0 {
                 "<a href=\"final\"></a>"
             } else {
@@ -464,33 +553,55 @@ async fn two_independent_nodes_own_a_convergent_graph_and_wait_for_delayed_disco
             NodeProcess::start(&context, 5),
         ];
         fixture.wait_for_headers(21).await;
-        let snapshot = store.snapshot(job).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = store.snapshot(job).await.unwrap();
+                if snapshot.in_flight == 40 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(snapshot.state, JobState::Running);
         assert_eq!(
             (snapshot.frontier, snapshot.in_flight, snapshot.processed),
-            (0, 20, 1)
+            (0, 40, 1)
         );
         assert_eq!(store.stats(job).await, Err(StoreError::NotFinished));
         let owners: HashMap<String, String> = context
             .query(redis::cmd("HGETALL").arg(context.job_key(job, "in-flight")))
             .await;
         let mut per_node = HashMap::new();
-        for owner in owners.into_values() {
-            *per_node.entry(owner).or_insert(0) += 1;
+        for owner in owners.values() {
+            *per_node.entry(owner.clone()).or_insert(0) += 1;
         }
-        assert_eq!(
-            per_node.len(),
-            2,
-            "both actual host processes must own HTTP work"
+        assert_eq!(per_node.len(), 2, "both host processes must own work");
+        assert!(
+            per_node
+                .values()
+                .all(|count| *count == MAX_NODE_OWNED_TASKS)
         );
-        assert!(per_node.values().all(|count| *count == 10));
+        // Correlate received GETs with unique claim owners: ten actual body-held
+        // HTTP requests per process, even though each owns twenty whole tasks.
+        let mut http_per_node = HashMap::new();
+        for request in fixture
+            .requests()
+            .into_iter()
+            .filter(|r| r.target != "/graph/")
+        {
+            let owner = &owners[fixture.url(&request.target).as_str()];
+            *http_per_node.entry(owner.clone()).or_insert(0) += 1;
+        }
+        assert!(http_per_node.values().all(|count| *count == 10));
         assert_eq!(fixture.peak(), 20);
-        gate.add_permits(20);
-        assert_eq!(done(&store, job).await, expected_html(23, 46));
+        gate.add_permits(40);
+        assert_eq!(done(&store, job).await, expected_html(43, 86));
         for node in &mut nodes {
             node.stop().await;
         }
-        assert_unique(&fixture, 23);
+        assert_unique(&fixture, 43);
         assert!(store.active_jobs().await.unwrap().is_empty());
     })
     .await
@@ -504,9 +615,9 @@ async fn sigterm_stops_claims_and_drains_late_links_then_a_new_node_finishes() {
         let gate = Arc::new(Semaphore::new(0));
         let mut routes = vec![(
             "/drain/".into(),
-            html("Seed words", (0..12).map(|i| format!("p{i}"))),
+            html("Seed words", (0..24).map(|i| format!("p{i}"))),
         )];
-        for i in 0..12 {
+        for i in 0..24 {
             let tail = if i == 0 { "<a href=\"late\"></a>" } else { " " };
             routes.push((
                 format!("/drain/p{i}"),
@@ -519,30 +630,37 @@ async fn sigterm_stops_claims_and_drains_late_links_then_a_new_node_finishes() {
         let job = store.submit(&fixture.url("/drain/")).await.unwrap().job;
         let mut node = NodeProcess::start(&context, 5);
         fixture.wait_for_headers(11).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.snapshot(job).await.unwrap().in_flight != MAX_NODE_OWNED_TASKS as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         node.signal("-TERM");
         node.wait_log("stopping claims; draining").await;
         node.signal("-INT"); // A second signal must not cancel the owned bodies.
         assert!(node.child.try_wait().unwrap().is_none());
-        gate.add_permits(10);
+        gate.add_permits(MAX_NODE_OWNED_TASKS);
         assert!(node.exit().await.success(), "{}", node.log());
-        fixture.wait_for_completed(11).await;
+        fixture.wait_for_completed(MAX_NODE_OWNED_TASKS + 1).await;
         assert_eq!(
             fixture.requests().len(),
-            11,
-            "shutdown must not start waiting URLs"
+            MAX_NODE_OWNED_TASKS + 1,
+            "shutdown drains HTTP-admission waiters but must not claim new URLs"
         );
         let snapshot = store.snapshot(job).await.unwrap();
         assert_eq!(snapshot.state, JobState::Running);
         assert_eq!(
             (snapshot.processed, snapshot.frontier, snapshot.in_flight),
-            (11, 3, 0)
+            (21, 5, 0)
         );
         assert_eq!(store.stats(job).await, Err(StoreError::NotFinished));
-        gate.add_permits(2);
+        gate.add_permits(4);
         let mut resumed = NodeProcess::start(&context, 5);
-        assert_eq!(done(&store, job).await, expected_html(14, 28));
+        assert_eq!(done(&store, job).await, expected_html(26, 52));
         resumed.stop().await;
-        assert_unique(&fixture, 14);
+        assert_unique(&fixture, 26);
         assert_eq!(
             context
                 .query::<u64>(redis::cmd("GET").arg(context.key("next-worker-id")))

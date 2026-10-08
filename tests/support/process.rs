@@ -54,6 +54,7 @@ impl Process {
             .env("SWARMCRAWL_REDIS_TIMEOUT_SECS", "5")
             .env("SWARMCRAWL_JOB_NAMESPACE", &context.namespace)
             .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
+            .env_remove("SWARMCRAWL_DIAGNOSTICS")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

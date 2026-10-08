@@ -10,6 +10,7 @@ use swarmcrawl::{
         ConfigError, DEFAULT_FETCH_TIMEOUT_SECS, DEFAULT_REDIS_TIMEOUT_SECS, DEFAULT_REDIS_URL,
         FetchConfig, RedisConfig,
     },
+    diagnostics::Diagnostics,
     fetch::Fetcher,
     jobs::{DEFAULT_JOB_NAMESPACE, JobStore},
     node::{run_node, shutdown_signal},
@@ -80,6 +81,10 @@ enum Command {
             hide_env_values = true
         )]
         fetch_timeout_secs: String,
+
+        /// Emit aggregate node timings/utilization on graceful exit (no URLs)
+        #[arg(long, env = "SWARMCRAWL_DIAGNOSTICS", hide_env_values = true)]
+        diagnostics: bool,
     },
 
     /// Submit one job per URL and return IDs without waiting for nodes
@@ -100,7 +105,7 @@ enum Command {
 
     /// Permanently abort one job, or all currently active jobs in this namespace
     #[command(
-        long_about = "Permanently abort a running job, or use --all for the active-job set captured at command start in this database/namespace. Stops new claims and rejects late publication. Already-owned HTTP work drains under existing deadlines; nodes stay available. Partial counters are retained for diagnosis, never exposed as final stats. No resume or restart by resubmission. Completed/failed/aborted jobs are unchanged. Each abort is atomic; --all is sequential, not a batch transaction, and does not include later submissions. The explicit command is confirmation; there is no extra prompt."
+        long_about = "Permanently abort a running job, or use --all for the active-job set captured at command start in this database/namespace. Stops new claims and rejects late publication. Already-owned work drains, including queued HTTP and HTML processing; HTTP deadlines still apply and nodes stay available. Partial counters are retained for diagnosis, never exposed as final stats. No resume or restart by resubmission. Completed/failed/aborted jobs are unchanged. Each abort is atomic; --all is sequential, not a batch transaction, and does not include later submissions. The explicit command is confirmation; there is no extra prompt."
     )]
     Abort {
         /// Namespace-local positive decimal job ID (mutually exclusive with --all)
@@ -173,11 +178,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             check_connection(&config).await?;
             println!("Redis connectivity: OK (PONG)");
         }
-        Command::Node { fetch_timeout_secs } => {
+        Command::Node {
+            fetch_timeout_secs,
+            diagnostics,
+        } => {
             let fetch_timeout_secs = fetch_timeout_secs
                 .parse::<u64>()
                 .map_err(|_| ConfigError::InvalidFetchTimeout)?;
-            let fetcher = Fetcher::new(FetchConfig::new(fetch_timeout_secs)?)?;
+            let fetcher = Fetcher::new(FetchConfig::new(fetch_timeout_secs)?)?.with_diagnostics(
+                if diagnostics {
+                    Diagnostics::enabled()
+                } else {
+                    Diagnostics::default()
+                },
+            );
             let shutdown = shutdown_signal()?;
             let store = JobStore::connect_in_namespace(&config, namespace).await?;
             run_node(store, fetcher, shutdown).await?;

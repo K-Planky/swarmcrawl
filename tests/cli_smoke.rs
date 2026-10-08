@@ -12,7 +12,8 @@ fn swarmcrawl(args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("SWARMCRAWL_REDIS_URL")
         .env_remove("SWARMCRAWL_REDIS_TIMEOUT_SECS")
         .env_remove("SWARMCRAWL_FETCH_TIMEOUT_SECS")
-        .env_remove("SWARMCRAWL_JOB_NAMESPACE");
+        .env_remove("SWARMCRAWL_JOB_NAMESPACE")
+        .env_remove("SWARMCRAWL_DIAGNOSTICS");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -53,7 +54,7 @@ fn help_and_version_work_without_redis() {
         }
         assert_eq!(
             subcommand_help.matches("[env: ").count(),
-            if name == "node" { 4 } else { 3 }
+            if name == "node" { 5 } else { 3 }
         );
     }
     let status_help = swarmcrawl(&["status", "--help"], &[]);
@@ -62,6 +63,8 @@ fn help_and_version_work_without_redis() {
     let node_help = swarmcrawl(&["node", "--help"], &[]);
     assert!(node_help.status.success());
     assert!(text(&node_help.stdout).contains("--fetch-timeout-secs"));
+    assert!(text(&node_help.stdout).contains("--diagnostics"));
+    assert!(text(&node_help.stdout).contains("[env: SWARMCRAWL_DIAGNOSTICS]"));
     assert!(text(&node_help.stdout).contains("[env: SWARMCRAWL_FETCH_TIMEOUT_SECS]"));
     assert!(text(&node_help.stdout).contains("--namespace"));
 

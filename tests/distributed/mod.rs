@@ -12,6 +12,7 @@ use super::{
 };
 use swarmcrawl::{
     jobs::{JobFailure, JobId, JobSnapshot, JobState, JobStore, StoreError},
+    node::MAX_NODE_OWNED_TASKS,
     stats::WebStats,
 };
 use tokio::sync::Semaphore;
@@ -247,9 +248,8 @@ async fn run_adversarial_graph(context: Context, node_count: usize) {
                 .header("Location", target),
         ));
     }
-    // Hold the seed until every process is ready, then freeze the first wave of
-    // 23 children. This guarantees all N nodes actually fetch graph work rather
-    // than merely starting N processes after one has already finished the graph.
+    // Hold the seed until every process is ready, then freeze child headers so
+    // claim ownership and HTTP admission can be inspected separately.
     let fixture = HttpFixture::start(routes.into_iter().map(|(path, reply)| {
         let headers = if path == "/site/" {
             &seed_gate
@@ -288,8 +288,10 @@ async fn run_adversarial_graph(context: Context, node_count: usize) {
         nodes.push(start_node(&context).await);
     }
     seed_gate.add_permits(1);
-    let first_wave = (10 * node_count).min(23);
-    fixture.wait_for_requests(first_wave + 1).await;
+    // Claims and HTTP admission now have distinct caps. This small graph need
+    // not engage every process; the broad overlapping graph below does.
+    let owned_wave = (MAX_NODE_OWNED_TASKS * node_count).min(23);
+    progress(&store, job, |s| s.in_flight == owned_wave as u64).await;
     let owners: HashMap<String, String> = context
         .query(redis::cmd("HGETALL").arg(context.job_key(job, "in-flight")))
         .await;
@@ -297,13 +299,29 @@ async fn run_adversarial_graph(context: Context, node_count: usize) {
     for owner in owners.values() {
         *per_node.entry(owner).or_default() += 1;
     }
-    assert_eq!(owners.len(), first_wave);
-    assert_eq!(
-        per_node.len(),
-        node_count,
-        "all N processes must participate"
+    assert_eq!(owners.len(), owned_wave);
+    assert!(per_node.len() <= node_count);
+    assert!(
+        per_node
+            .values()
+            .all(|count| *count <= MAX_NODE_OWNED_TASKS)
     );
-    assert!(per_node.values().all(|count| *count <= 10));
+    let http_wave = per_node
+        .values()
+        .map(|count| (*count).min(10))
+        .sum::<usize>();
+    fixture.wait_for_requests(http_wave + 1).await;
+    let mut http_per_node = HashMap::<_, usize>::new();
+    for request in fixture
+        .requests()
+        .into_iter()
+        .filter(|r| r.target != "/site/")
+    {
+        *http_per_node
+            .entry(owners[fixture.url(&request.target).as_str()].clone())
+            .or_default() += 1;
+    }
+    assert!(http_per_node.values().all(|count| *count <= 10));
     for request in fixture
         .requests()
         .into_iter()
@@ -392,6 +410,23 @@ async fn run_adversarial_graph(context: Context, node_count: usize) {
     assert!(store.active_jobs().await.unwrap().is_empty());
 }
 
+async fn wait_owned(store: &JobStore, jobs: &[JobId], expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut count = 0;
+            for job in jobs {
+                count += store.snapshot(*job).await.unwrap().in_flight;
+            }
+            if count == expected as u64 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded ownership admission milestone");
+}
+
 async fn assert_held_budget(
     context: &Context,
     jobs: &[JobId],
@@ -421,19 +456,21 @@ async fn assert_held_budget(
                 .or_default() += 1;
         }
     }
-    // Every owned item at this frozen milestone has issued a real GET. Shared
-    // URLs can appear once in each job, so compare multiplicities, not a set.
-    for (url, count) in held_urls {
-        let observed = received
-            .get_mut(&url)
-            .expect("owned body must have a received GET");
-        *observed = observed.checked_sub(count).expect("ownership exceeds GETs");
-    }
-    assert_eq!(received.values().sum::<usize>(), completed_bodies);
+    // Owned URLs include HTTP-admission waiters. Shared URLs appear once per
+    // job; compare multiplicities without inferring process identity from TCP.
+    let received_count = received.values().sum::<usize>();
+    let unmatched: usize = received
+        .iter()
+        .map(|(url, count)| count.saturating_sub(*held_urls.get(url).unwrap_or(&0)))
+        .sum();
+    assert_eq!(received_count, 10 * node_count + completed_bodies);
+    assert!(unmatched <= completed_bodies);
     assert_eq!(per_node.len(), node_count);
     assert!(
-        per_node.values().all(|count| *count == 10),
-        "per-process held HTTP ownership: {per_node:?}"
+        per_node
+            .values()
+            .all(|count| *count == MAX_NODE_OWNED_TASKS),
+        "per-process total owned tasks: {per_node:?}"
     );
 }
 
@@ -448,7 +485,7 @@ async fn overlapping_jobs_share_each_process_budget_and_survive_cluster_drain_re
 }
 
 async fn run_overlapping_jobs(context: Context, node_count: usize) {
-    let width = 10 * node_count + 3;
+    let width = MAX_NODE_OWNED_TASKS * node_count + 3;
     let gate = Arc::new(Semaphore::new(0));
     let mut routes = vec![
         (
@@ -489,12 +526,14 @@ async fn run_overlapping_jobs(context: Context, node_count: usize) {
         assert!(snapshot.in_flight > 0, "each overlapping job must advance");
         assert_eq!(store.stats(*job).await, Err(StoreError::NotFinished));
     }
+    wait_owned(&store, &jobs, MAX_NODE_OWNED_TASKS * node_count).await;
     assert_held_budget(&context, &jobs, node_count, &fixture, 0).await;
     gate.add_permits(1);
     fixture.wait_for_headers(10 * node_count + 4).await;
     // One completed body admits exactly one new GET, not a second pool
     // of ten for another job, nor early permit release after headers.
     assert_eq!(fixture.requests().len(), 10 * node_count + 4);
+    wait_owned(&store, &jobs, MAX_NODE_OWNED_TASKS * node_count).await;
     assert_held_budget(&context, &jobs, node_count, &fixture, 1).await;
     assert_eq!(fixture.peak(), 10 * node_count);
     for node in &nodes {
@@ -511,8 +550,8 @@ async fn run_overlapping_jobs(context: Context, node_count: usize) {
     }
     assert_eq!(
         fixture.requests().len(),
-        10 * node_count + 4,
-        "no new claims during drain"
+        MAX_NODE_OWNED_TASKS * node_count + 4,
+        "drain includes already-owned HTTP waiters, but no new claims"
     );
     for job in &jobs {
         let snapshot = store.snapshot(*job).await.unwrap();
@@ -594,8 +633,8 @@ async fn large_non_html_streams_release_slots_and_finish_without_consuming_body_
         fixture.wait_for_requests(11).await;
         assert_eq!(fixture.peak(), 10);
         let store = context.store().await;
-        let held = store.snapshot(job).await.unwrap();
-        assert_eq!((held.processed, held.in_flight, held.frontier), (1, 10, 3));
+        let held = progress(&store, job, |s| s.in_flight == 13).await;
+        assert_eq!((held.processed, held.in_flight, held.frontier), (1, 13, 0));
         headers.add_permits(12);
         let expected =
             WebStats::from_counts(HashMap::from([("html".into(), 2), ("zip".into(), 12)]), 4)
@@ -630,7 +669,7 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
                 html(
                     "Seed words",
                     std::iter::once("bad?token=fixture-query".into())
-                        .chain((0..12).map(|i| format!("p{i}"))),
+                        .chain((0..40).map(|i| format!("p{i}"))),
                 ),
             ),
             (
@@ -642,7 +681,7 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
                 html("Healthy words", []).gated_body(" ", &peers),
             ),
         ];
-        for i in 0..12 {
+        for i in 0..40 {
             routes.push((
                 format!("/fail/p{i}"),
                 html("Peer words", []).gated_body("<a href='late'></a>", &peers),
@@ -654,8 +693,9 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
         let jobs = ids(&run(&context, &["submit", bad.as_str(), good.as_str()]).await);
         let store = context.store().await;
         let mut nodes = [start_node(&context).await, start_node(&context).await];
-        fixture.wait_for_requests(15).await;
-        fixture.wait_for_headers(14).await;
+        fixture.wait_for_requests(21).await;
+        fixture.wait_for_headers(20).await;
+        progress(&store, jobs[0], |s| s.in_flight == 39).await;
         let owners: HashMap<String, String> = context
             .query(redis::cmd("HGETALL").arg(context.job_key(jobs[0], "in-flight")))
             .await;
@@ -664,7 +704,11 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
             *per_node.entry(owner).or_default() += 1;
         }
         assert_eq!(per_node.len(), 2, "both processes must own the failing job");
-        assert!(per_node.values().all(|count| *count <= 10));
+        assert!(
+            per_node
+                .values()
+                .all(|count| *count <= MAX_NODE_OWNED_TASKS)
+        );
         bad_gate.add_permits(1);
         tokio::time::timeout(Duration::from_secs(5), async {
             while store.snapshot(jobs[0]).await.unwrap().state == JobState::Running {
@@ -677,13 +721,13 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
         assert_eq!(frozen.state, JobState::Failed(JobFailure::Fetch));
         assert_eq!(
             (frozen.processed, frozen.successful_files, frozen.in_flight),
-            (1, 1, 13)
+            (1, 1, 39)
         );
         let failed_follow = run(&context, &["status", "-f", &jobs[0].to_string()]).await;
         assert_eq!(failed_follow.code, Some(1));
         assert!(failed_follow.stdout.ends_with("failed (fetch)\n"));
         assert_eq!(failed_follow.stdout.lines().count(), 1);
-        peers.add_permits(13);
+        peers.add_permits(40);
         for node in &mut nodes {
             let output = node.exit().await;
             assert_eq!(output.code, Some(1), "{}", output.stderr);
@@ -707,7 +751,7 @@ async fn cross_node_failure_freezes_late_publication_but_drains_a_healthy_job() 
         );
         stop_node(&mut replacement).await;
         let counts = request_counts(&fixture, 0);
-        assert_eq!(counts.len(), 15);
+        assert_eq!(counts.len(), 41);
         assert!(counts.values().all(|count| *count == 1));
         assert!(!counts.contains_key("/fail/late"));
         assert_eq!(store.snapshot(jobs[0]).await.unwrap(), frozen);

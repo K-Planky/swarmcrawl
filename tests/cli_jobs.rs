@@ -153,12 +153,12 @@ async fn abort_drains_two_nodes_discards_late_links_and_errors_and_keeps_nodes_a
             Reply::new(
                 200,
                 "text/html",
-                (0..22)
+                (0..42)
                     .map(|i| format!("<a href=p{i}></a>"))
                     .collect::<String>(),
             ),
         )];
-        for index in 0..22 {
+        for index in 0..42 {
             let reply = if index % 2 == 0 {
                 Reply::new(200, "text/html", "partial words").gated_body("<a href=late></a>", &gate)
             } else {
@@ -172,18 +172,18 @@ async fn abort_drains_two_nodes_discards_late_links_and_errors_and_keeps_nodes_a
         let job = ids(&run(&context, &["submit", base.as_str()]).await)[0];
         let id = job.to_string();
         let mut first = start_node(&context).await;
-        fixture.wait_for_requests(11).await; // First node holds all ten slots.
+        fixture.wait_for_requests(11).await; // First node holds ten HTTP slots (up to 20 claims).
         let mut second = start_node(&context).await;
         fixture.wait_for_requests(21).await; // Second node holds ten more.
         let store = context.store().await;
         let mut follow = Process::start(&context, &["status", "-f", &id]);
-        follow.wait_stdout("frontier 2  in flight 20").await;
+        follow.wait_stdout("frontier 2  in flight 40").await;
         success(&run(&context, &["abort", &id]).await);
         let frozen = store.snapshot(job).await.unwrap();
         assert_eq!(frozen.state, JobState::Aborted);
         assert_eq!(
             (frozen.processed, frozen.frontier, frozen.in_flight),
-            (1, 2, 20)
+            (1, 2, 40)
         );
         let output = follow.exit().await;
         assert_eq!(output.code, Some(1));
@@ -194,7 +194,7 @@ async fn abort_drains_two_nodes_discards_late_links_and_errors_and_keeps_nodes_a
         assert!(output.stdout.is_empty());
         assert!(first.running() && second.running());
         let healthy = ids(&run(&context, &["submit", fixture.url("/healthy/").as_str()]).await)[0];
-        gate.add_permits(20);
+        gate.add_permits(40);
         success(&run(&context, &["status", "-f", &healthy.to_string()]).await);
         assert!(first.running() && second.running());
         // Graceful drains prove every late outcome (including 503s) was processed
@@ -204,14 +204,14 @@ async fn abort_drains_two_nodes_discards_late_links_and_errors_and_keeps_nodes_a
         assert_eq!(store.snapshot(job).await.unwrap(), frozen);
         assert_eq!(store.stats(healthy).await.unwrap().total_word_count, 2);
         assert_eq!(ids(&run(&context, &["submit", base.as_str()]).await), [job]);
-        assert_eq!(fixture.requests().len(), 22); // seed + 20 owners + healthy
+        assert_eq!(fixture.requests().len(), 42); // seed + 40 owners (including HTTP waiters) + healthy
         assert!(
             !fixture
                 .requests()
                 .iter()
                 .any(|request| request.target.ends_with("late")
-                    || request.target.ends_with("p20")
-                    || request.target.ends_with("p21"))
+                    || request.target.ends_with("p40")
+                    || request.target.ends_with("p41"))
         );
         let listed = run(&context, &["jobs"]).await;
         success(&listed);

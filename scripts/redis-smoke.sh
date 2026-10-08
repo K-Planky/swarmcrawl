@@ -88,4 +88,6 @@ if [[ "$host_ready" != true ]]; then
 fi
 
 timeout 180s cargo run --locked --bin swarmcrawl -- check
+# White-box CPU/publication gates use the same real, isolated Redis protocol.
+timeout 180s cargo test --locked --lib -- --ignored
 timeout 180s cargo test --locked --test redis_connectivity --test redis_jobs --test redis_frontier --test node_process --test cli_jobs -- --ignored

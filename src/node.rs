@@ -5,17 +5,22 @@ use std::{collections::VecDeque, error::Error, fmt, future::Future, time::Durati
 use tokio::{task::JoinSet, time::MissedTickBehavior};
 
 use crate::{
-    fetch::{FetchError, Fetcher, MAX_NODE_REQUESTS},
+    diagnostics::{Activity, Stage, Timer},
+    fetch::{FetchError, Fetcher},
     html::HtmlError,
     jobs::{Completion, JobFailure, JobId, JobStore, StoreError, WorkClaim},
     urls::CrawlScope,
 };
 
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A small amount of look-ahead lets HTTP overlap CPU/publication without an
+/// unbounded frontier preclaim or body queue. Shared across every job in this node.
+pub const MAX_NODE_OWNED_TASKS: usize = 20;
 
 /// Stay available for later submissions. Exactly one fetcher is shared by every
-/// owned task. Limit whole tasks too, so claims/parsers/publications cannot grow
-/// without bound even after their HTTP permits have been released.
+/// owned task. At most 20 whole tasks may be owned, independently of the ten
+/// HTTP permits and four CPU permits. This bounds claims, buffered body count,
+/// and pending publications while allowing these phases to overlap.
 ///
 /// Shutdown and unexpected errors stop new claims, but never cancel an in-progress
 /// Redis claim/write: finish that bounded operation, then drain all owned tasks.
@@ -56,7 +61,7 @@ pub async fn run_node(
             }
             // Refresh ahead of ready scheduling, so a busy job cannot indefinitely
             // delay discovery of a newly submitted job.
-            _ = poll.tick(), if tasks.len() < MAX_NODE_REQUESTS => {
+            _ = poll.tick(), if tasks.len() < MAX_NODE_OWNED_TASKS => {
                 match store.active_jobs().await {
                     Ok(jobs) => candidates = after_cursor(jobs, cursor),
                     Err(error) => break Err(NodeError::Store { job: None, error }),
@@ -65,14 +70,19 @@ pub async fn run_node(
                 // tick win forever ahead of claims. Start the next interval now.
                 poll.reset();
             }
-            _ = std::future::ready(()), if tasks.len() < MAX_NODE_REQUESTS && !candidates.is_empty() => {
+            _ = std::future::ready(()), if tasks.len() < MAX_NODE_OWNED_TASKS && !candidates.is_empty() => {
                 let job = candidates.pop_front().expect("nonempty candidates");
                 match store.claim(job, &worker).await {
                     Ok(Some(claim)) => {
                         cursor = Some(job);
                         let store = store.clone();
                         let fetcher = fetcher.clone();
-                        tasks.spawn(async move { crawl_owned(&store, &fetcher, claim).await });
+                        let admission = fetcher.diagnostics().timer(Stage::HttpAdmission);
+                        let owned = fetcher.diagnostics().enter(Activity::Owned);
+                        tasks.spawn(async move {
+                            let _owned = owned;
+                            crawl_owned(&store, &fetcher, claim, admission).await
+                        });
                         candidates.push_back(job);
                     }
                     Ok(None) => {} // Idle now, not proof of global completion.
@@ -101,6 +111,7 @@ pub async fn run_node(
             }
         }
     }
+    fetcher.diagnostics().report();
     eprintln!("node {} drained; exiting", std::process::id());
     outcome
 }
@@ -119,10 +130,14 @@ async fn crawl_owned(
     store: &JobStore,
     fetcher: &Fetcher,
     claim: WorkClaim,
+    admission: Timer,
 ) -> Result<(), NodeError> {
     let job = claim.job();
     let scope = CrawlScope::new(claim.base().clone());
-    let fetched = fetcher.fetch(&scope, claim.url()).await;
+    let fetched = fetcher.fetch_owned(&scope, claim.url(), admission).await;
+    let publication = fetcher.diagnostics().timer(Stage::Publication);
+    #[cfg(test)]
+    fetcher.wait_publication_gate().await;
     let completion = match &fetched {
         Ok(outcome) => {
             store
@@ -135,10 +150,16 @@ async fn crawl_owned(
         job: Some(job),
         error,
     })?;
-    // Abort wins over a late HTTP success OR failure. It is user intent, not a
-    // node operational failure; keep serving unrelated and future jobs.
+    drop(publication);
+    // Abort discards late HTTP/decoding outcomes, not node CPU execution faults.
+    // A parser panic used to surface as an owned-task panic even after abort;
+    // moving it to a blocking worker must not silently hide that operational error.
     if let Err(error) = fetched
-        && completion != Completion::Aborted
+        && (completion != Completion::Aborted
+            || matches!(
+                error,
+                FetchError::CpuTaskFailed | FetchError::CpuBudgetClosed
+            ))
     {
         return Err(NodeError::Fetch { job, error });
     }
@@ -160,6 +181,8 @@ fn failure_category(error: FetchError) -> JobFailure {
         FetchError::Html(HtmlError::WordCountOverflow) => JobFailure::Statistics,
         FetchError::OutsideScope
         | FetchError::BudgetClosed
+        | FetchError::CpuBudgetClosed
+        | FetchError::CpuTaskFailed
         | FetchError::ClientSetup
         | FetchError::Html(HtmlError::PageOutsideScope) => JobFailure::Protocol,
         _ => JobFailure::Fetch,
@@ -278,5 +301,8 @@ mod tests {
             failure_category(FetchError::Html(HtmlError::PageOutsideScope)),
             JobFailure::Protocol
         );
+        for error in [FetchError::CpuTaskFailed, FetchError::CpuBudgetClosed] {
+            assert_eq!(failure_category(error), JobFailure::Protocol);
+        }
     }
 }

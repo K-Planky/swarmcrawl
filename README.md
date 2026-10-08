@@ -94,7 +94,7 @@ Replace the example IP with the host's actual address and enter the same passwor
 | `check`                       | Verify Redis connectivity with PING.                                                  |
 | `cluster <command>`           | Initialize, join, inspect, start, stop, or remove a deployment.                       |
 
-Aborting stops new claims and discards late results; already-owned HTTP work drains. Resubmitting a done, failed, or aborted job does **not** restart it. Use a new namespace for an independent run. See `swarmcrawl --help` or `swarmcrawl <command> --help` for options.
+Aborting stops new claims and discards late results; already-owned work drains, including queued HTTP and HTML processing. Resubmitting a done, failed, or aborted job does **not** restart it. Use a new namespace for an independent run. See `swarmcrawl --help` or `swarmcrawl <command> --help` for options.
 
 ## Configuration
 
@@ -106,6 +106,7 @@ Connection precedence: **flags → environment → saved settings → defaults**
 | `--namespace`               | `SWARMCRAWL_JOB_NAMESPACE`      | `swarmcrawl:v1`            |
 | `--redis-timeout-secs`      | `SWARMCRAWL_REDIS_TIMEOUT_SECS` | `5` (range 1–60)           |
 | `node --fetch-timeout-secs` | `SWARMCRAWL_FETCH_TIMEOUT_SECS` | `30` (range 1–300)         |
+| `node --diagnostics`        | `SWARMCRAWL_DIAGNOSTICS`        | `false`                    |
 
 Only the connection and namespace are saved. `SWARMCRAWL_CONFIG_DIR` overrides the per-user configuration directory. Prefer password prompts or environment configuration over credentials in command-line arguments. Redis TLS and Unix sockets are not supported.
 
@@ -140,7 +141,9 @@ Final `WebStats` are readable as soon as a job is done and have no expiry. Dedup
 
 ## Limits and failures
 
-Each node reuses HTTP/1.1 connections, with up to ten idle connections per host and a 30-second idle timeout. The ten-request limit includes response-body transfer.
+Each node reuses HTTP/1.1 connections, with up to ten idle connections per host and a 30-second idle timeout. The ten-request limit includes response-body transfer. Separately, a node owns at most **20 crawl tasks** across all jobs and admits at most **four blocking HTML decoding/parsing jobs** (running or queued). Fetching can overlap with HTML processing and Redis publication without unbounded claiming or buffering.
+
+These are task/body-count bounds, not a byte-size limit. Graceful shutdown drains every owned task, including HTTP-admission waiters, queued/running HTML work, and pending publication. Already-owned requests may therefore start after shutdown stops new claims. An HTML CPU-task failure fails the job and exits the node nonzero after draining; it never produces partial final statistics.
 
 There are no application-level retries. Stale connections may be replaced only before a request is dispatched; started requests are never retried. Timeouts, transport/decoding errors, 408/429, 5xx, and unsupported response statuses fail the job rather than produce partial final results. A node encountering an operational error stops claiming, drains owned work, and exits nonzero; inspect its diagnostics and restart it to serve other jobs.
 
@@ -161,3 +164,48 @@ The smoke script requires Docker, Bash, and GNU `timeout`; it provisions isolate
 ```sh
 cargo test --locked --test cluster_setup -- --ignored
 ```
+
+## Performance measurements
+
+`swarmcrawl node --diagnostics` (or `SWARMCRAWL_DIAGNOSTICS=true`) emits one
+`swarmcrawl_metrics` JSON line on stderr **after drain**. Diagnostics are disabled
+by default and contain only numeric, node-local aggregates—not URLs, queries,
+headers, HTML, or credentials. Progress and `WebStats` are unchanged.
+
+Timings contain count, total, and maximum nanoseconds for claim-to-HTTP admission,
+HTTP transfer (through the full HTML body, but only headers for non-HTML), CPU
+admission (including blocking-pool queueing), decoding, parsing, and publication
+(local preparation plus the Redis reply). HTTP, CPU, and owned-task gauges contain
+current/peak counts and integrated active nanoseconds. HTTP utilization is
+`http.active_ns / (10 * elapsed_ns)`; the reporting window includes startup, idle
+time, and drain. Failed operations also contribute their observed durations.
+
+For reproducible, opt-in **Linux/WSL2** benchmarks, install Python 3, OpenSSL, and
+Docker, then run:
+
+```sh
+cargo build --release --locked --bin swarmcrawl --example benchmark_node
+python3 scripts/benchmark-crawl.py --repeats 5 --output target/benchmark.json
+```
+
+The benchmark provisions its own loopback Docker Redis, generates a temporary CA
+and HTTPS server certificate, and uses immutable local latency, large-HTML,
+broad/deep, and mixed-resource graphs. Only the separate `benchmark_node` runner
+explicitly trusts that CA; the ordinary CLI is checked to reject it. TLS and
+hostname verification remain enabled. Every run has a fresh namespace, a bounded
+crawl/drain, exact statistics and GET-count checks, and owned-resource cleanup.
+No existing Redis is cleared. Results include every run, median/range/standard
+deviation, throughput, HTTP utilization, node CPU seconds, and per-node peak RSS
+(excluding fixtures, Redis, and CLI processes). The sum of per-node RSS peaks is
+not a simultaneous cluster-memory peak.
+
+To compare retained **instrumented release** binaries, add `--baseline-node PATH
+--baseline-cli PATH`; the harness alternates baseline/candidate order and runs one
+and three nodes by default. See `--help` for case and deadline options. There are
+no performance assertions in correctness tests.
+
+A local five-run comparison found large-page throughput gains of about **1.25×
+(one node)** and **1.16× (three nodes)**, with much lower parser-related peak
+memory. Small-page gains were modest; the low-latency broad graph was slightly
+slower and deep chains were essentially unchanged. This is workload-dependent,
+not a promise of a universal speedup.
